@@ -42,16 +42,23 @@ jobs:
           & $msbuild -version
           Get-ChildItem (Join-Path $vs "MSBuild\Microsoft\VisualStudio") -Recurse -Filter Microsoft.Build.Packaging.Pri.Tasks.dll -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "PRI tasks: $($_.FullName)" }
           $out = Join-Path $PWD "publish_selfcontained\"
-          & $msbuild PulseRAM.csproj -restore -t:Publish -v:minimal -nologo `
+          & $msbuild PulseRAM.csproj -restore -t:Publish -v:normal -nologo "-flp:logfile=msbuild.log;verbosity=detailed" `
             -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:SelfContained=true `
             "-p:PublishDir=$out" `
             -p:EnableCoreMrtTooling=true -p:AppxGeneratePriEnabled=true -p:IncludeProjectPriFile=true
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $code = $LASTEXITCODE
+          Write-Host "== PRI-related MSBuild targets =="
+          Select-String -Path msbuild.log -Pattern 'Target "(_GenerateProjectPri|_ExpandPri|_CreateProjectPriFileItem|_GenerateProjectPriFileCore|_ExpandProjectPriFile)[^"]*"|MakePri|Skipping target "_GenerateProjectPri' |
+            Select-Object -First 60 | ForEach-Object { Write-Host $_.Line.Trim() }
+          if ($code -ne 0) { exit $code }
 
       - name: Verify WinUI resources are present
         shell: pwsh
         run: |
           $dir = "publish_selfcontained"
+          Write-Host "== PRI / XBF anywhere in bin, obj, publish =="
+          Get-ChildItem bin, obj, $dir -Recurse -Include *.pri, *.xbf, priconfig.xml, *.resfiles -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("{0,10}  {1}" -f $_.Length, $_.FullName) }
           Get-ChildItem $dir -Filter *.pri | Select-Object Name, Length | Format-Table -AutoSize
           if (Test-Path "$dir\Microsoft.UI.Xaml") { Get-ChildItem "$dir\Microsoft.UI.Xaml" -Recurse | Select-Object FullName | Format-Table -AutoSize }
           $missing = @()
