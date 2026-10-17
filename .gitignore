@@ -1,0 +1,23 @@
+# Build and output directories
+bin/
+obj/
+bin_winui3/
+publish_selfcontained/
+dist/
+
+# Visual Studio & IDE files
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+
+# Runtime logs and machine-specific cache
+*.log
+startup.log
+pulseram_history.json
+
+# Windows thumbnails and OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini

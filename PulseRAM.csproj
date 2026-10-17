@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>PulseRAM</RootNamespace>
+    <AssemblyName>PulseRAM</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>PulseRAM.ico</ApplicationIcon>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <EnableCoreMrtTooling>false</EnableCoreMrtTooling>
+    <AppxGeneratePriEnabled>false</AppxGeneratePriEnabled>
+    <AppxGeneratePrisForPortableLibrariesEnabled>false</AppxGeneratePrisForPortableLibrariesEnabled>
+    <AppxGetPackagePropertiesEnabled>false</AppxGetPackagePropertiesEnabled>
+    <IncludeProjectPriFile>false</IncludeProjectPriFile>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <EnableDefaultPageItems>false</EnableDefaultPageItems>
+    <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="PulseRAM.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250108002" />
+  </ItemGroup>
+</Project>
