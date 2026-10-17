@@ -920,7 +920,6 @@ namespace PulseRAM
         private void SetSelfEfficiencyMode(bool on)
         {
             if (on == _selfEfficiencyOn) return;
-            _selfEfficiencyOn = on;
             try
             {
                 var state = new PROCESS_POWER_THROTTLING_STATE
@@ -929,8 +928,9 @@ namespace PulseRAM
                     ControlMask = on ? 1u : 0u,   // 0 = let Windows decide again
                     StateMask = on ? 1u : 0u
                 };
-                SetProcessInformation(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, ref state, (uint)Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>());
-                SetPriorityClass(GetCurrentProcess(), on ? 0x00004000u /* BELOW_NORMAL */ : 0x00000020u /* NORMAL */);
+                bool qos = SetProcessInformation(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, ref state, (uint)Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>());
+                bool prio = SetPriorityClass(GetCurrentProcess(), on ? 0x00004000u /* BELOW_NORMAL */ : 0x00000020u /* NORMAL */);
+                if (qos || prio) _selfEfficiencyOn = on;
             }
             catch { }
         }
@@ -2987,7 +2987,7 @@ namespace PulseRAM
         }
 
         /// <summary>Standby cache explained: per-priority sizes, eviction rate, and whether a purge would help.</summary>
-        private static string BuildStandbyTooltip(MemorySnapshot snap)
+        private string BuildStandbyTooltip(MemorySnapshot snap)
         {
             var sb = new System.Text.StringBuilder();
             sb.Append("Cached files Windows can drop instantly when an app needs RAM.");
@@ -3002,9 +3002,16 @@ namespace PulseRAM
             {
                 sb.Append("\n\nRun as Admin to see it by priority.");
             }
-            sb.Append(snap.StandbyPurgeWorthwhile
-                ? "\n\nFree memory is low — a purge would help."
-                : "\n\nFree memory is fine — Auto-Pilot leaves the cache alone.");
+            if (!snap.StandbyPurgeSupported)
+                sb.Append("\n\nPurging the cache needs Admin.");
+            else if (snap.StandbyPurgeWorthwhile)
+                sb.Append("\n\nFree memory is low — a purge would help.");
+            else if (!_engine.Config.SmartStandbyPurge)
+                sb.Append("\n\nSmart purge is off — automatic sweeps purge anyway.");
+            else if (snap.StandbyAndCacheGb < Math.Max(0.5, snap.TotalGb * 0.10))
+                sb.Append("\n\nThe cache is small — Auto-Pilot leaves it alone.");
+            else
+                sb.Append("\n\nFree memory is fine — Auto-Pilot leaves the cache alone.");
             return sb.ToString();
         }
 
