@@ -24,6 +24,15 @@ namespace PulseRAM
         public double FreeExactGb { get; set; }
         /// <summary>True when Standby/Free values come from the real memory-list counters, false when they are estimates.</summary>
         public bool MemoryListsMeasured { get; set; }
+        /// <summary>Standby list per priority 0–7 in GB (null when the kernel memory-list query is unavailable).</summary>
+        public double[]? StandbyByPriorityGb { get; set; }
+        /// <summary>
+        /// How fast Windows is evicting standby (cached) pages to satisfy new allocations, in MB/min.
+        /// Negative when unknown. Sustained repurposing means real memory pressure.
+        /// </summary>
+        public double RepurposeMbPerMin { get; set; } = -1;
+        /// <summary>True when purging the standby cache would actually help (free memory is low / cache is being evicted).</summary>
+        public bool StandbyPurgeWorthwhile { get; set; }
         public double Percent { get; set; }
         public string PressureLevel { get; set; } = "OPTIMAL";
         public double CommitTotalGb { get; set; }
@@ -102,6 +111,8 @@ namespace PulseRAM
         public bool StandbyPurged { get; set; }
         public bool ModifiedFlushed { get; set; }
         public bool PagesCombined { get; set; }
+        /// <summary>Memory saved by combining identical pages, in MB.</summary>
+        public double CombinedMb { get; set; }
         /// <summary>True when nothing was done (e.g. a kernel-only mode without administrator rights).</summary>
         public bool Skipped { get; set; }
         /// <summary>Extra human-readable detail, e.g. why the kernel purge was skipped.</summary>
@@ -173,6 +184,15 @@ namespace PulseRAM
         public List<WorkloadProfile> Profiles { get; set; } = new List<WorkloadProfile>();
         /// <summary>"auto" (lite on low-end PCs), "lite" (no ambient animation, slower refresh) or "full".</summary>
         public string UiMode { get; set; } = "auto";
+        /// <summary>
+        /// Automatic sweeps only purge the standby cache when free memory is low or Windows is already evicting
+        /// cache. Purging a healthy cache just makes apps reload from disk. Manual sweeps always purge.
+        /// </summary>
+        public bool SmartStandbyPurge { get; set; } = true;
+        /// <summary>Draw the current RAM % into the tray icon.</summary>
+        public bool TrayShowsPercent { get; set; } = true;
+        /// <summary>Run PulseRAM itself in Windows Efficiency Mode (EcoQoS) while it is hidden in the tray.</summary>
+        public bool EfficiencyModeWhenHidden { get; set; } = true;
         /// <summary>Tier the defaults were tuned for on first run ("low", "mid", "high"; empty = not tuned).</summary>
         public string TunedForTier { get; set; } = "";
     }
@@ -291,6 +311,22 @@ namespace PulseRAM
 
         [DllImport("ntdll.dll")]
         private static extern int NtSetSystemInformation(int SystemInformationClass, ref MEMORY_COMBINE_INFORMATION_EX SystemInfo, int SystemInfoLength);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SYSTEM_MEMORY_LIST_INFORMATION
+        {
+            public UIntPtr ZeroPageCount;
+            public UIntPtr FreePageCount;
+            public UIntPtr ModifiedPageCount;
+            public UIntPtr ModifiedNoWritePageCount;
+            public UIntPtr BadPageCount;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)] public UIntPtr[] PageCountByPriority;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)] public UIntPtr[] RepurposedPagesByPriority;
+            public UIntPtr ModifiedPageCountPageFile;
+        }
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtQuerySystemInformation(int SystemInformationClass, ref SYSTEM_MEMORY_LIST_INFORMATION SystemInformation, int SystemInformationLength, out int ReturnLength);
 
         [DllImport("ntdll.dll")]
         private static extern int NtSuspendProcess(IntPtr ProcessHandle);
@@ -596,6 +632,11 @@ namespace PulseRAM
         private DateTime _lastCpuSampleTime = DateTime.MinValue;
         private double _cachedSystemCpuPercent = 0.0;
         private ulong _lastSysIdle, _lastSysKernel, _lastSysUser;
+        private ulong _lastRepurposedPages;
+        private DateTime _lastRepurposeSample = DateTime.MinValue;
+        private double _repurposeMbPerMin = -1;
+        private bool _memListQueryFailed;
+        private readonly object _repurposeLock = new object();
 
         private List<ProcessItem> _cachedGroupedProcesses = new List<ProcessItem>();
         private List<ProcessItem> _cachedIndividualProcesses = new List<ProcessItem>();
@@ -1233,6 +1274,62 @@ namespace PulseRAM
                 freeGb = Math.Max(0.0, availGb - standbyGb);
             }
 
+            // Kernel memory lists (same data as System Informer's "Memory lists"): standby per priority and the
+            // cumulative count of standby pages Windows has repurposed. Needs SeProfileSingleProcessPrivilege.
+            double[]? standbyByPriority = null;
+            if (_privilegesEnabled && !_memListQueryFailed)
+            {
+                try
+                {
+                    var ml = new SYSTEM_MEMORY_LIST_INFORMATION
+                    {
+                        PageCountByPriority = new UIntPtr[8],
+                        RepurposedPagesByPriority = new UIntPtr[8]
+                    };
+                    int status = NtQuerySystemInformation(SystemMemoryListInformation, ref ml, Marshal.SizeOf<SYSTEM_MEMORY_LIST_INFORMATION>(), out _);
+                    if (status == 0)
+                    {
+                        standbyByPriority = new double[8];
+                        ulong repurposed = 0;
+                        for (int i = 0; i < 8; i++)
+                        {
+                            standbyByPriority[i] = ml.PageCountByPriority[i].ToUInt64() * pageSize / GB;
+                            repurposed += ml.RepurposedPagesByPriority[i].ToUInt64();
+                        }
+                        var now = DateTime.Now;
+                        lock (_repurposeLock)
+                        {
+                        if (_lastRepurposeSample != DateTime.MinValue && repurposed >= _lastRepurposedPages)
+                        {
+                            double minutes = (now - _lastRepurposeSample).TotalMinutes;
+                            if (minutes >= 0.02)
+                            {
+                                double mbPerMin = (repurposed - _lastRepurposedPages) * pageSize / (1024.0 * 1024.0) / minutes;
+                                // Smooth it so one burst doesn't flip the decision.
+                                _repurposeMbPerMin = _repurposeMbPerMin < 0 ? mbPerMin : _repurposeMbPerMin * 0.7 + mbPerMin * 0.3;
+                            }
+                        }
+                        _lastRepurposedPages = repurposed;
+                        _lastRepurposeSample = now;
+                        }
+                    }
+                    else
+                    {
+                        _memListQueryFailed = true;
+                    }
+                }
+                catch
+                {
+                    _memListQueryFailed = true;
+                }
+            }
+
+            // Purging standby only helps when free memory is actually scarce: otherwise Windows hands out free
+            // pages anyway and the purge just throws away useful cache. Repurposing confirms real pressure.
+            double lowFreeGb = Math.Max(0.5, totalGb * 0.04);
+            bool cacheIsLarge = standbyGb >= Math.Max(0.5, totalGb * 0.10);
+            bool purgeWorthwhile = cacheIsLarge && (freeGb < lowFreeGb || _repurposeMbPerMin >= 64.0);
+
             double commitTotalGb = (perfInfo.CommitTotal.ToUInt64() * pageSize) / GB;
             double commitLimitGb = Math.Max(0.1, (perfInfo.CommitLimit.ToUInt64() * pageSize) / GB);
             double commitPct = (commitTotalGb / commitLimitGb) * 100.0;
@@ -1299,6 +1396,9 @@ namespace PulseRAM
                 StandbyAndCacheGb = Math.Round(standbyGb, 2),
                 FreeExactGb = Math.Round(freeGb, 2),
                 MemoryListsMeasured = listsMeasured,
+                StandbyByPriorityGb = standbyByPriority,
+                RepurposeMbPerMin = Math.Round(_repurposeMbPerMin, 0),
+                StandbyPurgeWorthwhile = purgeWorthwhile,
                 Percent = Math.Round(percent, 1),
                 PressureLevel = pressure,
                 CommitTotalGb = Math.Round(commitTotalGb, 2),
@@ -1694,6 +1794,10 @@ namespace PulseRAM
             }
         }
 
+        /// <summary>Sweeps PulseRAM started on its own (as opposed to the user clicking, a hotkey or the tray menu).</summary>
+        private static bool IsAutomaticTrigger(string trigger) =>
+            trigger is "Auto-Pilot" or "Scheduled" or "Profile Launch Boost";
+
         private OptimizationEvent OptimizeMemoryCore(string mode, string trigger, string reason)
         {
             var sw = Stopwatch.StartNew();
@@ -1703,6 +1807,25 @@ namespace PulseRAM
             string normMode = (mode ?? "smart").ToLowerInvariant();
             if (!IsKnownMode(normMode)) normMode = "smart";
             bool wantsKernel = normMode is "deep" or "standby" or "max";
+            // Smart standby purge: on automatic sweeps, skip the cache purge unless it would actually help.
+            bool skipPurgeNoPressure = wantsKernel && _privilegesEnabled && Config.SmartStandbyPurge
+                && IsAutomaticTrigger(trigger) && !beforeSnap.StandbyPurgeWorthwhile;
+            string noPressureNote = $"Standby purge skipped: {beforeSnap.FreeExactGb:F1} GB already free and Windows isn't evicting cache, so purging would only discard useful cache.";
+
+            if (normMode == "standby" && skipPurgeNoPressure)
+            {
+                return RecordEvent(new OptimizationEvent
+                {
+                    Mode = "STANDBY",
+                    Trigger = trigger,
+                    Reason = reason,
+                    BeforePercent = beforeSnap.Percent,
+                    AfterPercent = beforeSnap.Percent,
+                    DurationMs = sw.ElapsedMilliseconds,
+                    Skipped = true,
+                    Note = noPressureNote
+                }, countAsOptimization: false, trigger);
+            }
 
             if (normMode == "standby" && !_privilegesEnabled)
             {
@@ -1724,6 +1847,7 @@ namespace PulseRAM
             bool standbyPurged = false;
             bool modifiedFlushed = false;
             bool pagesCombined = false;
+            double combinedMb = 0;
 
             if (normMode is "smart" or "deep" or "max")
             {
@@ -1794,16 +1918,22 @@ namespace PulseRAM
                 {
                     var combineInfo = new MEMORY_COMBINE_INFORMATION_EX();
                     if (NtSetSystemInformation(SystemCombinePhysicalMemoryInformation, ref combineInfo, Marshal.SizeOf<MEMORY_COMBINE_INFORMATION_EX>()) == 0)
+                    {
                         pagesCombined = true;
+                        combinedMb = combineInfo.PagesCombined.ToUInt64() * 4096.0 / (1024.0 * 1024.0);
+                    }
                 }
 
-                int cmdFlush = MemoryFlushModifiedList;
-                if (NtSetSystemInformation(SystemMemoryListInformation, ref cmdFlush, sizeof(int)) == 0)
-                    modifiedFlushed = true;
+                if (!skipPurgeNoPressure)
+                {
+                    int cmdFlush = MemoryFlushModifiedList;
+                    if (NtSetSystemInformation(SystemMemoryListInformation, ref cmdFlush, sizeof(int)) == 0)
+                        modifiedFlushed = true;
 
-                int cmdStandby = normMode == "deep" ? MemoryPurgeLowPriorityStandbyList : MemoryPurgeStandbyList;
-                if (NtSetSystemInformation(SystemMemoryListInformation, ref cmdStandby, sizeof(int)) == 0)
-                    standbyPurged = true;
+                    int cmdStandby = normMode == "deep" ? MemoryPurgeLowPriorityStandbyList : MemoryPurgeStandbyList;
+                    if (NtSetSystemInformation(SystemMemoryListInformation, ref cmdStandby, sizeof(int)) == 0)
+                        standbyPurged = true;
+                }
             }
 
             Thread.Sleep(150);
@@ -1818,6 +1948,8 @@ namespace PulseRAM
             string note = "";
             if (wantsKernel && !_privilegesEnabled)
                 note = "Kernel purge skipped — run PulseRAM as administrator to purge the standby list.";
+            else if (skipPurgeNoPressure)
+                note = noPressureNote;
 
             return RecordEvent(new OptimizationEvent
             {
@@ -1835,6 +1967,7 @@ namespace PulseRAM
                 StandbyPurged = standbyPurged,
                 ModifiedFlushed = modifiedFlushed,
                 PagesCombined = pagesCombined,
+                CombinedMb = Math.Round(combinedMb, 1),
                 Note = note
             }, countAsOptimization: true, trigger);
         }
