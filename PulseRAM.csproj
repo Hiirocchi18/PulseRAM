@@ -1,10 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <!-- .NET 10 (LTS). .NET 8 reaches end of support on 10 Nov 2026. -->
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>PulseRAM</RootNamespace>
     <AssemblyName>PulseRAM</AssemblyName>
+    <Version>1.1.0</Version>
+    <Company>Hiirocchi18</Company>
+    <Product>PulseRAM</Product>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>PulseRAM.ico</ApplicationIcon>
     <Platforms>x64</Platforms>
@@ -28,6 +32,20 @@
     <Content Include="PulseRAM.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <!-- Default settings read on first run (user settings are saved to %LocalAppData%\PulseRAM). -->
+    <Content Include="pulseram_defaults.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250108002" />
   </ItemGroup>
+  <!--
+    Unpackaged WinUI apps load their merged resource index from resources.pri next to the EXE.
+    When PRI generation is enabled (release builds: -p:EnableCoreMrtTooling=true -p:AppxGeneratePriEnabled=true),
+    publish does not copy the generated $(TargetName).pri, so copy it as resources.pri.
+  -->
+  <Target Name="PulseRamCopyResourcesPri" AfterTargets="Publish" Condition="'$(ProjectPriFullPath)' != '' and Exists('$(ProjectPriFullPath)')">
+    <Copy SourceFiles="$(ProjectPriFullPath)" DestinationFiles="$(PublishDir)resources.pri" />
+    <Message Importance="high" Text="PulseRAM: copied $(ProjectPriFullPath) -> $(PublishDir)resources.pri" />
+  </Target>
 </Project>
