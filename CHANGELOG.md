@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.2.0 — 2026-10-18
+
+Ideas borrowed (as designs, not code) from MIT-licensed [System Informer](https://github.com/winsiderss/systeminformer), [H.NotifyIcon](https://github.com/HavenDV/H.NotifyIcon) and [tray-monitor](https://github.com/strayge/tray-monitor).
+
+### New
+- **Live RAM % in the tray icon.** The icon shows the current memory load and turns amber/red under pressure — readable at a glance without opening PulseRAM. Drawn natively for every display scaling (16–32 px). Toggle: *Profiles → Device → Tray %*.
+- **Efficiency Mode while hidden.** PulseRAM runs itself with EcoQoS and below-normal priority while it sits in the tray, and returns to normal when you open it. Toggle: *Eco in tray*.
+- **Smart standby purge.** Automatic sweeps (Auto-Pilot, schedule, profile launch) now empty the standby cache only when it would help: free memory is low, or Windows is already evicting cached pages. Purging a healthy cache just makes apps reload from disk. Manual sweeps still always purge. Toggle: *Smart purge*.
+- **See the standby cache.** Hover *Standby* on the dashboard for the cache split by priority, the live eviction rate (as administrator), and whether a purge would help right now.
+- **Page combining is measured.** Deep and Max sweeps report how much memory deduplicating identical pages saved.
+
+### Notes
+- The standby-by-priority breakdown and eviction rate need administrator rights (the same kernel query System Informer uses); without them the free/standby totals still come from Windows' performance counters.
+
 ## v1.1.0 — 2026-10-17
 
 A reliability and honesty release: Auto-Pilot no longer fights low-RAM PCs, nothing can stay frozen by accident, every number shown is measured, and the app tunes itself to the PC it runs on.

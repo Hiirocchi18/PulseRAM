@@ -24,6 +24,10 @@
   "HotkeysEnabled": true,
   "HotkeyPrimary": "Ctrl+Alt+Shift+M",
   "HotkeySecondary": "Ctrl+Alt+Shift+P",
+  "SmartStandbyPurge": true,
+  "TrayShowsPercent": true,
+  "EfficiencyModeWhenHidden": true,
+  "UiMode": "auto",
   "ProtectedApps": [
     "dwm.exe",
     "audiodg.exe",
