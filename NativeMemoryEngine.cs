@@ -222,6 +222,8 @@ namespace PulseRAM
         public string Body { get; init; } = "";
         /// <summary>True when changing the page file is part of the fix (offer to open its settings).</summary>
         public bool SuggestPageFile { get; init; }
+        /// <summary>Same level was already announced within 30 minutes: show the banner, skip the notification.</summary>
+        public bool IsRepeat { get; set; }
     }
 
     public sealed class DeviceInfo
@@ -1290,16 +1292,17 @@ namespace PulseRAM
 
         /// <summary>
         /// Trimming can't help here: committed memory counts against RAM + page file whether or not it is in RAM.
-        /// When it nears the limit, new allocations fail ("out of memory", apps crash). Warns when the level rises;
-        /// the same level is not repeated within 30 minutes (so hovering around a threshold can't spam), but a
-        /// jump to "critical" always warns.
+        /// When it nears the limit, new allocations fail ("out of memory", apps crash). On every rise the banner is
+        /// shown; the Windows notification for the same level is not repeated within 30 minutes, so hovering around a
+        /// threshold can't spam.
         /// </summary>
         private void CheckCommitPressure(MemorySnapshot snap)
         {
             string level = snap.CommitLevel;
             if (!Config.CommitWarningEnabled || level == "ok")
             {
-                _lastWarnedLevel = level;
+                // While disabled, forget what was announced so re-enabling during pressure warns at once.
+                _lastWarnedLevel = "ok";
                 return;
             }
 
@@ -1312,13 +1315,16 @@ namespace PulseRAM
             }
 
             _lastWarnedLevel = level;
-            bool repeatTooSoon = rank <= _lastWarningRank && (DateTime.Now - _lastCommitWarning).TotalMinutes < 30;
-            if (repeatTooSoon) return;
-
-            _lastWarningRank = rank;
-            _lastCommitWarning = DateTime.Now;
+            // The banner is always (re)shown on escalation; only the Windows notification is rate-limited.
+            bool repeat = rank <= _lastWarningRank && (DateTime.Now - _lastCommitWarning).TotalMinutes < 30;
             var advice = BuildCommitAdvice(snap);
-            Log.Warn($"Commit charge {snap.CommitPercent:F0}% ({snap.CommitTotalGb:F1}/{snap.CommitLimitGb:F1} GB): {advice.Title}");
+            advice.IsRepeat = repeat;
+            if (!repeat)
+            {
+                _lastWarningRank = rank;
+                _lastCommitWarning = DateTime.Now;
+                Log.Warn($"Commit charge {snap.CommitPercent:F0}% ({snap.CommitTotalGb:F1}/{snap.CommitLimitGb:F1} GB): {advice.Title}");
+            }
             try { OnCommitWarning?.Invoke(advice); } catch (Exception ex) { Log.Error("Commit warning handler failed", ex); }
         }
 

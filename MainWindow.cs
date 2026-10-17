@@ -205,6 +205,25 @@ namespace PulseRAM
         private const uint NIIF_WARNING = 0x00000002;
         private const uint NIN_BALLOONUSERCLICK = 0x0400 + 5;
         private const uint WM_GETMINMAXINFO = 0x0024;
+        private const uint WM_ENDSESSION = 0x0016;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MONITORINFO
+        {
+            public int cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public uint dwFlags;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct MINMAXINFO
@@ -595,7 +614,6 @@ namespace PulseRAM
             ApplyTitleBarColors();
             try
             {
-                if (_isMiniHud) ToggleMiniHudMode();
                 _toastTimer?.Stop();
                 foreach (var sb in new[] { _reactorBreathingStoryboard, _reactorOrbitalStoryboard, _logoPulseStoryboard })
                 {
@@ -612,7 +630,8 @@ namespace PulseRAM
                 _displayedPercent = 0;
                 _displayedUsedRatio = 0.01;
                 _displayedCombinedRatio = 0.01;
-                SwitchView(_currentView);
+                if (_isMiniHud) ApplyMiniHudLayout(); // stay in the Mini HUD; window size and on-top are untouched
+                else SwitchView(_currentView);
                 SelectCleaningMode(_selectedMode);
                 ApplyPerformanceMode();
                 StartAmbientXamlAnimations();
@@ -641,7 +660,10 @@ namespace PulseRAM
                     if (area != null)
                     {
                         var wa = area.WorkArea;
-                        _appWindow.MoveAndResize(new RectInt32(x, y, Math.Min(w, wa.Width), Math.Min(h, wa.Height)));
+                        // Move first, then size: a single MoveAndResize onto a monitor with a different DPI can be
+                        // rescaled by the DPI-change handling and come back the wrong size.
+                        _appWindow.Move(new PointInt32(x, y));
+                        _appWindow.Resize(new SizeInt32(Math.Min(w, wa.Width), Math.Min(h, wa.Height)));
                         return;
                     }
                 }
@@ -747,7 +769,7 @@ namespace PulseRAM
             _commitBannerFixBtn.Visibility = advice.SuggestPageFile ? Visibility.Visible : Visibility.Collapsed;
             _commitBanner.Visibility = Visibility.Visible;
 
-            if (announce && !IsDashboardVisible())
+            if (announce && !advice.IsRepeat && !IsDashboardVisible())
                 ShowTrayBalloon($"PulseRAM: {advice.Title}", advice.Body, warning: true);
         }
 
@@ -1302,6 +1324,12 @@ namespace PulseRAM
 
         private IntPtr CustomWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
         {
+            if (msg == WM_ENDSESSION && wParam != IntPtr.Zero)
+            {
+                // Windows is restarting or signing out: the process is about to end without Window.Closed,
+                // so thaw frozen apps, save state and mark the session as cleanly ended now.
+                ShutdownCleanup("Windows session ending");
+            }
             if (msg == WM_GETMINMAXINFO && lParam != IntPtr.Zero)
             {
                 // Minimum size so the layout never collapses (smaller for the Mini HUD).
@@ -1310,8 +1338,17 @@ namespace PulseRAM
                 {
                     var mmi = Marshal.PtrToStructure<MINMAXINFO>(lParam);
                     double scale = Math.Max(1.0, GetDpiForWindow(hWnd) / 96.0);
-                    mmi.ptMinTrackSize.X = (int)((_isMiniHud ? 300 : 900) * scale);
-                    mmi.ptMinTrackSize.Y = (int)((_isMiniHud ? 400 : 600) * scale);
+                    int minW = (int)((_isMiniHud ? 300 : 900) * scale);
+                    int minH = (int)((_isMiniHud ? 400 : 600) * scale);
+                    // Never demand more than the screen has (e.g. 1366×768 at 125%).
+                    var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+                    if (GetMonitorInfo(MonitorFromWindow(hWnd, 2 /* MONITOR_DEFAULTTONEAREST */), ref mi))
+                    {
+                        minW = Math.Min(minW, mi.rcWork.Right - mi.rcWork.Left);
+                        minH = Math.Min(minH, mi.rcWork.Bottom - mi.rcWork.Top);
+                    }
+                    mmi.ptMinTrackSize.X = minW;
+                    mmi.ptMinTrackSize.Y = minH;
                     Marshal.StructureToPtr(mmi, lParam, false);
                 }
                 catch { }
@@ -1409,8 +1446,15 @@ namespace PulseRAM
             }
         }
 
-        private void OnMainWindowClosed(object sender, WindowEventArgs args)
+        private void OnMainWindowClosed(object sender, WindowEventArgs args) => ShutdownCleanup("Clean shutdown");
+
+        private bool _shutdownDone;
+
+        /// <summary>Idempotent: runs on window close and on WM_ENDSESSION (Windows restart / sign-out).</summary>
+        private void ShutdownCleanup(string reason)
         {
+            if (_shutdownDone) return;
+            _shutdownDone = true;
             try
             {
                 _uiTimer.Stop();
@@ -1428,7 +1472,7 @@ namespace PulseRAM
                 }
                 SaveWindowPlacement();
                 _engine.Dispose();
-                Log.Info("Clean shutdown");
+                Log.Info(reason);
                 Log.MarkSessionEnd();
             }
             catch (Exception ex)
@@ -3213,13 +3257,7 @@ namespace PulseRAM
         private void ToggleMiniHudMode()
         {
             _isMiniHud = !_isMiniHud;
-            SwitchView("overview");
-
-            _rightColumnOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
-            _bottomSplitOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
-            _miniHudBtn.Content = new FontIcon { Glyph = _isMiniHud ? "\uE73F" : "\uE944", FontSize = 13 };
-            ToolTipService.SetToolTip(_miniHudBtn, _isMiniHud ? "Back to full view" : "Compact, always-on-top view");
-            _miniHudBtn.BorderBrush = _isMiniHud ? BrushHex("#10B981") : BrushHex("#94A3B8", 45);
+            ApplyMiniHudLayout();
 
             try
             {
@@ -3227,9 +3265,29 @@ namespace PulseRAM
                 {
                     presenter.IsAlwaysOnTop = _isMiniHud;
                 }
-                _appWindow.Resize(_isMiniHud ? new SizeInt32(430, 760) : new SizeInt32(1440, 930));
+                if (_isMiniHud)
+                {
+                    double scale = Math.Max(1.0, GetDpiForWindow(_hwnd) / 96.0);
+                    _appWindow.Resize(new SizeInt32((int)(430 * scale), (int)(760 * scale)));
+                }
+                else
+                {
+                    // Back to the user's own size (or a size that fits the screen), never a fixed 1440×930.
+                    RestoreWindowPlacement();
+                }
             }
             catch { }
+        }
+
+        /// <summary>Element states for Mini HUD on/off (also re-applied after a theme rebuild).</summary>
+        private void ApplyMiniHudLayout()
+        {
+            SwitchView("overview");
+            _rightColumnOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
+            _bottomSplitOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
+            _miniHudBtn.Content = new FontIcon { Glyph = _isMiniHud ? "\uE73F" : "\uE944", FontSize = 13 };
+            ToolTipService.SetToolTip(_miniHudBtn, _isMiniHud ? "Back to full view" : "Compact, always-on-top view");
+            _miniHudBtn.BorderBrush = _isMiniHud ? BrushHex("#10B981") : BrushHex("#94A3B8", 45);
         }
 
         private void ToggleFocusBoost()
