@@ -62,7 +62,8 @@ jobs:
           Get-ChildItem $dir -Filter *.pri | Select-Object Name, Length | Format-Table -AutoSize
           if (Test-Path "$dir\Microsoft.UI.Xaml") { Get-ChildItem "$dir\Microsoft.UI.Xaml" -Recurse | Select-Object FullName | Format-Table -AutoSize }
           $missing = @()
-          foreach ($f in @("PulseRAM.exe", "PulseRAM.dll", "resources.pri", "pulseram_defaults.json", "Microsoft.UI.Xaml\Themes\themeresources.xbf")) {
+          if (-not (Test-Path "$dir\Microsoft.UI.Xaml\Themes")) { Write-Host "Note: no loose Microsoft.UI.Xaml\Themes files (themes are read from the PRI files); the smoke test decides." }
+          foreach ($f in @("PulseRAM.exe", "PulseRAM.dll", "resources.pri", "Microsoft.UI.Xaml.Controls.pri", "pulseram_defaults.json")) {
             if (-not (Test-Path (Join-Path $dir $f))) { $missing += $f }
           }
           if ($missing.Count -gt 0) { Write-Error "Missing from publish output: $($missing -join ', ')"; exit 1 }

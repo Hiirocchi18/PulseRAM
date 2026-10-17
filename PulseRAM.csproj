@@ -39,4 +39,13 @@
     </Content>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250108002" />
   </ItemGroup>
+  <!--
+    Unpackaged WinUI apps load their merged resource index from resources.pri next to the EXE.
+    When PRI generation is enabled (release builds: -p:EnableCoreMrtTooling=true -p:AppxGeneratePriEnabled=true),
+    publish does not copy the generated $(TargetName).pri, so copy it as resources.pri.
+  -->
+  <Target Name="PulseRamCopyResourcesPri" AfterTargets="Publish" Condition="'$(ProjectPriFullPath)' != '' and Exists('$(ProjectPriFullPath)')">
+    <Copy SourceFiles="$(ProjectPriFullPath)" DestinationFiles="$(PublishDir)resources.pri" />
+    <Message Importance="high" Text="PulseRAM: copied $(ProjectPriFullPath) -> $(PublishDir)resources.pri" />
+  </Target>
 </Project>
