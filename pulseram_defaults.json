@@ -28,6 +28,8 @@
   "TrayShowsPercent": true,
   "EfficiencyModeWhenHidden": true,
   "UiMode": "auto",
+  "Theme": "system",
+  "CommitWarningEnabled": true,
   "ProtectedApps": [
     "dwm.exe",
     "audiodg.exe",

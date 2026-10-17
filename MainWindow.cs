@@ -200,6 +200,40 @@ namespace PulseRAM
         private const uint NIF_MESSAGE = 0x00000001;
         private const uint NIF_ICON = 0x00000002;
         private const uint NIF_TIP = 0x00000004;
+        private const uint NIF_INFO = 0x00000010;
+        private const uint NIIF_INFO = 0x00000001;
+        private const uint NIIF_WARNING = 0x00000002;
+        private const uint NIN_BALLOONUSERCLICK = 0x0400 + 5;
+        private const uint WM_GETMINMAXINFO = 0x0024;
+        private const uint WM_ENDSESSION = 0x0016;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MONITORINFO
+        {
+            public int cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public uint dwFlags;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MINMAXINFO
+        {
+            public POINT ptReserved;
+            public POINT ptMaxSize;
+            public POINT ptMaxPosition;
+            public POINT ptMinTrackSize;
+            public POINT ptMaxTrackSize;
+        }
 
         private const uint TPM_RETURNCMD = 0x0100;
         private const uint TPM_NONOTIFY = 0x0080;
@@ -220,6 +254,22 @@ namespace PulseRAM
         private IntPtr _trayPercentIcon = IntPtr.Zero;   // live RAM % icon currently shown (owned by us)
         private string _trayIconKey = "";                // percent|color|size of the icon being shown
         private bool _selfEfficiencyOn = false;
+
+        // Theme: every colour goes through BrushHex, which swaps the dark palette for a light one.
+        private static bool s_lightTheme;
+        private readonly Windows.UI.ViewManagement.UISettings _uiSettings = new Windows.UI.ViewManagement.UISettings();
+
+        // Window placement
+        private DispatcherQueueTimer? _placementTimer;
+
+        // Commit-charge warning
+        private Border _commitBanner = null!;
+        private TextBlock _commitBannerTitle = null!;
+        private TextBlock _commitBannerBody = null!;
+        private Button _commitBannerFixBtn = null!;
+        private CommitAdvice? _commitAdvice;
+
+        private DateTime _lastErrorToast = DateTime.MinValue;
         private uint _showWindowMsg = 0;
         private uint _taskbarCreatedMsg = 0;
         private uint _exitForInstallerMsg = 0;
@@ -274,9 +324,10 @@ namespace PulseRAM
         private TextBlock _apStatusPillText = null!;
         private Ellipse _apStatusDot = null!;
         private Border _apStatusPill = null!;
-        private readonly ToolTip _apStatusTip = new ToolTip();
-        private readonly ToolTip _adminTip = new ToolTip();
-        private readonly ToolTip _standbyTip = new ToolTip();
+        // Recreated on every UI build: a ToolTip may only belong to one element tree.
+        private ToolTip _apStatusTip = new ToolTip();
+        private ToolTip _adminTip = new ToolTip();
+        private ToolTip _standbyTip = new ToolTip();
         private TextBlock _sessionFreedTopText = null!;
         private Button _miniHudBtn = null!;
         private Button _adminBtn = null!;
@@ -378,8 +429,31 @@ namespace PulseRAM
             var windowId = Win32Interop.GetWindowIdFromWindow(_hwnd);
             _appWindow = AppWindow.GetFromWindowId(windowId);
 
+            s_lightTheme = ResolveLightTheme();
             ConfigureWindowFrameAndIcon();
             BuildWinUI3Interface();
+
+            // Follow Windows when it switches between light and dark (event arrives on a background thread).
+            _uiSettings.ColorValuesChanged += (s, e) => DispatcherQueue.TryEnqueue(() =>
+            {
+                if (_engine.Config.Theme == "system") ApplyTheme();
+            });
+
+            _engine.OnCommitWarning += advice => DispatcherQueue.TryEnqueue(() => ShowCommitWarning(advice));
+
+            // Remember size/position (debounced).
+            _placementTimer = DispatcherQueue.CreateTimer();
+            _placementTimer.Interval = TimeSpan.FromSeconds(1);
+            _placementTimer.IsRepeating = false;
+            _placementTimer.Tick += (s, e) => SaveWindowPlacement();
+            _appWindow.Changed += (s, e) =>
+            {
+                if (e.DidPositionChange || e.DidSizeChange || e.DidPresenterChange)
+                {
+                    _placementTimer?.Stop();
+                    _placementTimer?.Start();
+                }
+            };
 
             Closed += OnMainWindowClosed;
 
@@ -437,6 +511,8 @@ namespace PulseRAM
 
                 if (!string.IsNullOrEmpty(_hotkeyStatus))
                     ShowToast("Hotkey unavailable", _hotkeyStatus);
+                else if (Program.PreviousSessionCrashed)
+                    ShowToast("PulseRAM closed unexpectedly last time", "Details are in the log: Profiles → Device → Logs.");
             }
             catch { }
         }
@@ -480,28 +556,254 @@ namespace PulseRAM
 
             try
             {
-                if (AppWindowTitleBar.IsCustomizationSupported())
-                {
-                    var tb = _appWindow.TitleBar;
-                    tb.BackgroundColor = Color.FromArgb(255, 6, 10, 18);
-                    tb.InactiveBackgroundColor = Color.FromArgb(255, 6, 10, 18);
-                    tb.ForegroundColor = Color.FromArgb(255, 248, 250, 252);
-                    tb.ButtonBackgroundColor = Color.FromArgb(255, 6, 10, 18);
-                    tb.ButtonHoverBackgroundColor = Color.FromArgb(255, 30, 41, 59);
-                    tb.ButtonForegroundColor = Color.FromArgb(255, 248, 250, 252);
-                }
-
-                _appWindow.Resize(new SizeInt32(1440, 930));
-                var displayArea = DisplayArea.GetFromWindowId(_appWindow.Id, DisplayAreaFallback.Primary);
-                if (displayArea != null)
-                {
-                    int x = Math.Max(0, (displayArea.WorkArea.Width - 1440) / 2);
-                    int y = Math.Max(0, (displayArea.WorkArea.Height - 930) / 2);
-                    _appWindow.Move(new PointInt32(x, y));
-                }
+                ApplyTitleBarColors();
+                RestoreWindowPlacement();
             }
             catch { }
         }
+
+        #region Theme, window placement
+
+        private bool SystemUsesLightTheme()
+        {
+            try
+            {
+                var bg = _uiSettings.GetColorValue(Windows.UI.ViewManagement.UIColorType.Background);
+                return bg.R > 128;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool ResolveLightTheme() => _engine.Config.Theme switch
+        {
+            "light" => true,
+            "dark" => false,
+            _ => SystemUsesLightTheme()
+        };
+
+        private void ApplyTitleBarColors()
+        {
+            try
+            {
+                if (!AppWindowTitleBar.IsCustomizationSupported()) return;
+                var tb = _appWindow.TitleBar;
+                Color bg = s_lightTheme ? Color.FromArgb(255, 238, 242, 247) : Color.FromArgb(255, 6, 10, 18);
+                Color fg = s_lightTheme ? Color.FromArgb(255, 15, 23, 42) : Color.FromArgb(255, 248, 250, 252);
+                Color hover = s_lightTheme ? Color.FromArgb(255, 226, 232, 240) : Color.FromArgb(255, 30, 41, 59);
+                tb.BackgroundColor = bg;
+                tb.InactiveBackgroundColor = bg;
+                tb.ForegroundColor = fg;
+                tb.ButtonBackgroundColor = bg;
+                tb.ButtonInactiveBackgroundColor = bg;
+                tb.ButtonHoverBackgroundColor = hover;
+                tb.ButtonForegroundColor = fg;
+                tb.ButtonHoverForegroundColor = fg;
+            }
+            catch { }
+        }
+
+        /// <summary>Switches light/dark by rebuilding the (code-built) interface with the other palette.</summary>
+        private void ApplyTheme()
+        {
+            bool light = ResolveLightTheme();
+            if (light == s_lightTheme) return;
+            s_lightTheme = light;
+            ApplyTitleBarColors();
+            try
+            {
+                _toastTimer?.Stop();
+                foreach (var sb in new[] { _reactorBreathingStoryboard, _reactorOrbitalStoryboard, _logoPulseStoryboard })
+                {
+                    try { sb?.Stop(); } catch { }
+                }
+                _reactorBreathingStoryboard = null;
+                _reactorOrbitalStoryboard = null;
+                _logoPulseStoryboard = null;
+                _modeCards.Clear();
+                _filterButtons.Clear();
+
+                BuildWinUI3Interface();
+
+                _displayedPercent = 0;
+                _displayedUsedRatio = 0.01;
+                _displayedCombinedRatio = 0.01;
+                if (_isMiniHud) ApplyMiniHudLayout(); // stay in the Mini HUD; window size and on-top are untouched
+                else SwitchView(_currentView);
+                SelectCleaningMode(_selectedMode);
+                ApplyPerformanceMode();
+                StartAmbientXamlAnimations();
+                RefreshAllUi(force: true);
+                if (_commitAdvice != null) ShowCommitWarning(_commitAdvice, announce: false);
+                Log.Info($"Theme switched to {(light ? "light" : "dark")}");
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Theme switch failed", ex);
+            }
+        }
+
+        /// <summary>
+        /// Restores the last size/position if it is still on a connected screen; otherwise centres a size that
+        /// fits the primary work area (1440×930 at most, so small laptop screens aren't overflowed).
+        /// </summary>
+        private void RestoreWindowPlacement()
+        {
+            try
+            {
+                var cfg = _engine.Config;
+                if (cfg.WindowX is int x && cfg.WindowY is int y && cfg.WindowWidth is int w && cfg.WindowHeight is int h && w >= 300 && h >= 300)
+                {
+                    var area = DisplayArea.GetFromPoint(new PointInt32(x + Math.Min(w, 200) / 2, y + 16), DisplayAreaFallback.None);
+                    if (area != null)
+                    {
+                        var wa = area.WorkArea;
+                        // Move first, then size: a single MoveAndResize onto a monitor with a different DPI can be
+                        // rescaled by the DPI-change handling and come back the wrong size.
+                        _appWindow.Move(new PointInt32(x, y));
+                        _appWindow.Resize(new SizeInt32(Math.Min(w, wa.Width), Math.Min(h, wa.Height)));
+                        return;
+                    }
+                }
+
+                var primary = DisplayArea.GetFromWindowId(_appWindow.Id, DisplayAreaFallback.Primary);
+                var work = primary?.WorkArea ?? new RectInt32(0, 0, 1440, 930);
+                int width = Math.Min(1440, (int)(work.Width * 0.95));
+                int height = Math.Min(930, (int)(work.Height * 0.95));
+                _appWindow.MoveAndResize(new RectInt32(work.X + (work.Width - width) / 2, work.Y + (work.Height - height) / 2, width, height));
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("Could not restore window placement", ex);
+            }
+        }
+
+        private void SaveWindowPlacement()
+        {
+            try
+            {
+                if (_isMiniHud || !IsWindowVisible(_hwnd) || IsIconic(_hwnd)) return;
+                var cfg = _engine.Config;
+                bool maximized = _appWindow.Presenter is OverlappedPresenter op && op.State == OverlappedPresenterState.Maximized;
+                bool changed = maximized != cfg.WindowMaximized;
+                cfg.WindowMaximized = maximized;
+                if (!maximized)
+                {
+                    var pos = _appWindow.Position;
+                    var size = _appWindow.Size;
+                    changed |= cfg.WindowX != pos.X || cfg.WindowY != pos.Y || cfg.WindowWidth != size.Width || cfg.WindowHeight != size.Height;
+                    cfg.WindowX = pos.X;
+                    cfg.WindowY = pos.Y;
+                    cfg.WindowWidth = size.Width;
+                    cfg.WindowHeight = size.Height;
+                }
+                if (changed) _engine.SaveConfig();
+            }
+            catch { }
+        }
+
+        #endregion
+
+        #region Commit warning, error reporting
+
+        private Border BuildCommitBanner()
+        {
+            var b = new Border
+            {
+                CornerRadius = new CornerRadius(12),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(14, 10, 10, 10),
+                Visibility = Visibility.Collapsed
+            };
+            var g = new Grid { ColumnSpacing = 12 };
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var icon = new FontIcon { Glyph = "\uE7BA", FontSize = 18, VerticalAlignment = VerticalAlignment.Center };
+            g.Children.Add(icon);
+
+            var text = new StackPanel { Spacing = 1, VerticalAlignment = VerticalAlignment.Center };
+            _commitBannerTitle = new TextBlock { FontSize = 13, FontWeight = FontWeights.Bold, Foreground = BrushHex("#F8FAFC") };
+            _commitBannerBody = new TextBlock { FontSize = 12, Foreground = BrushHex("#94A3B8"), TextWrapping = TextWrapping.Wrap };
+            text.Children.Add(_commitBannerTitle);
+            text.Children.Add(_commitBannerBody);
+            Grid.SetColumn(text, 1);
+            g.Children.Add(text);
+
+            _commitBannerFixBtn = new Button { Content = "Page file settings", FontSize = 12, CornerRadius = new CornerRadius(8), VerticalAlignment = VerticalAlignment.Center };
+            ToolTipService.SetToolTip(_commitBannerFixBtn, "Opens Performance Options → Advanced → Virtual memory.");
+            _commitBannerFixBtn.Click += (s, e) =>
+            {
+                try { Process.Start(new ProcessStartInfo("SystemPropertiesPerformance.exe") { UseShellExecute = true }); }
+                catch (Exception ex) { Log.Warn("Could not open page-file settings", ex); }
+            };
+            Grid.SetColumn(_commitBannerFixBtn, 2);
+            g.Children.Add(_commitBannerFixBtn);
+
+            var dismiss = new Button { Content = new FontIcon { Glyph = "\uE711", FontSize = 12 }, Padding = new Thickness(8), Background = new SolidColorBrush(Colors.Transparent), BorderThickness = new Thickness(0), VerticalAlignment = VerticalAlignment.Center };
+            ToolTipService.SetToolTip(dismiss, "Dismiss");
+            dismiss.Click += (s, e) => { _commitBanner.Visibility = Visibility.Collapsed; _commitAdvice = null; };
+            Grid.SetColumn(dismiss, 3);
+            g.Children.Add(dismiss);
+
+            b.Child = g;
+            b.Tag = icon;
+            return b;
+        }
+
+        /// <summary>Shows the commit-charge warning as a banner, and as a tray notification while hidden.</summary>
+        private void ShowCommitWarning(CommitAdvice advice, bool announce = true)
+        {
+            _commitAdvice = advice;
+            bool critical = advice.Level == "critical";
+            string hex = critical ? "#F43F5E" : "#F59E0B";
+            _commitBanner.Background = BrushHex(hex, 30);
+            _commitBanner.BorderBrush = BrushHex(hex, 140);
+            if (_commitBanner.Tag is FontIcon icon) icon.Foreground = BrushHex(hex);
+            _commitBannerTitle.Text = advice.Title;
+            _commitBannerBody.Text = advice.Body;
+            _commitBannerFixBtn.Visibility = advice.SuggestPageFile ? Visibility.Visible : Visibility.Collapsed;
+            _commitBanner.Visibility = Visibility.Visible;
+
+            if (announce && !advice.IsRepeat && !IsDashboardVisible())
+                ShowTrayBalloon($"PulseRAM: {advice.Title}", advice.Body, warning: true);
+        }
+
+        private void ShowTrayBalloon(string title, string text, bool warning)
+        {
+            if (!_trayInitialized) return;
+            try
+            {
+                _trayData.uFlags = NIF_INFO;
+                _trayData.szInfoTitle = title.Length > 63 ? title.Substring(0, 63) : title;
+                _trayData.szInfo = text.Length > 255 ? text.Substring(0, 252) + "…" : text;
+                _trayData.dwInfoFlags = warning ? NIIF_WARNING : NIIF_INFO;
+                Shell_NotifyIcon(NIM_MODIFY, ref _trayData);
+            }
+            catch { }
+            finally
+            {
+                _trayData.szInfo = "";
+                _trayData.szInfoTitle = "";
+            }
+        }
+
+        /// <summary>Called (any thread) when a UI exception was caught and logged.</summary>
+        public void ReportUnexpectedError(string message)
+        {
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                if ((DateTime.Now - _lastErrorToast).TotalSeconds < 60) return;
+                _lastErrorToast = DateTime.Now;
+                try { ShowToast("Something went wrong", "PulseRAM kept running. Details: Profiles → Device → Logs."); } catch { }
+            });
+        }
+
+        #endregion
 
         #region Custom WinUI 3 XAML Animations
 
@@ -1014,13 +1316,44 @@ namespace PulseRAM
         /// <summary>Shows, restores and focuses the dashboard, then renders it immediately.</summary>
         public void ShowMainWindow()
         {
-            ShowWindow(_hwnd, 9); // SW_RESTORE
+            // SW_SHOWMAXIMIZED if it was maximised last time, otherwise SW_RESTORE.
+            ShowWindow(_hwnd, _engine.Config.WindowMaximized && !_isMiniHud ? 3 : 9);
             SetForegroundWindow(_hwnd);
             RefreshAllUi(force: true);
         }
 
         private IntPtr CustomWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
         {
+            if (msg == WM_ENDSESSION && wParam != IntPtr.Zero)
+            {
+                // Windows is restarting or signing out: the process is about to end without Window.Closed,
+                // so thaw frozen apps, save state and mark the session as cleanly ended now.
+                ShutdownCleanup("Windows session ending");
+            }
+            if (msg == WM_GETMINMAXINFO && lParam != IntPtr.Zero)
+            {
+                // Minimum size so the layout never collapses (smaller for the Mini HUD).
+                IntPtr result = CallWindowProc(_oldWndProc, hWnd, msg, wParam, lParam);
+                try
+                {
+                    var mmi = Marshal.PtrToStructure<MINMAXINFO>(lParam);
+                    double scale = Math.Max(1.0, GetDpiForWindow(hWnd) / 96.0);
+                    int minW = (int)((_isMiniHud ? 300 : 900) * scale);
+                    int minH = (int)((_isMiniHud ? 400 : 600) * scale);
+                    // Never demand more than the screen has (e.g. 1366×768 at 125%).
+                    var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+                    if (GetMonitorInfo(MonitorFromWindow(hWnd, 2 /* MONITOR_DEFAULTTONEAREST */), ref mi))
+                    {
+                        minW = Math.Min(minW, mi.rcWork.Right - mi.rcWork.Left);
+                        minH = Math.Min(minH, mi.rcWork.Bottom - mi.rcWork.Top);
+                    }
+                    mmi.ptMinTrackSize.X = minW;
+                    mmi.ptMinTrackSize.Y = minH;
+                    Marshal.StructureToPtr(mmi, lParam, false);
+                }
+                catch { }
+                return result;
+            }
             if (msg == WM_HOTKEY)
             {
                 int id = wParam.ToInt32();
@@ -1036,7 +1369,7 @@ namespace PulseRAM
             else if (msg == WM_USER_TRAY)
             {
                 uint mouseMsg = (uint)(lParam.ToInt64() & 0xFFFF);
-                if (mouseMsg == WM_LBUTTONDBLCLK)
+                if (mouseMsg == WM_LBUTTONDBLCLK || mouseMsg == NIN_BALLOONUSERCLICK)
                 {
                     ShowMainWindow();
                 }
@@ -1113,8 +1446,15 @@ namespace PulseRAM
             }
         }
 
-        private void OnMainWindowClosed(object sender, WindowEventArgs args)
+        private void OnMainWindowClosed(object sender, WindowEventArgs args) => ShutdownCleanup("Clean shutdown");
+
+        private bool _shutdownDone;
+
+        /// <summary>Idempotent: runs on window close and on WM_ENDSESSION (Windows restart / sign-out).</summary>
+        private void ShutdownCleanup(string reason)
         {
+            if (_shutdownDone) return;
+            _shutdownDone = true;
             try
             {
                 _uiTimer.Stop();
@@ -1130,17 +1470,38 @@ namespace PulseRAM
                     DestroyIcon(_trayPercentIcon);
                     _trayPercentIcon = IntPtr.Zero;
                 }
+                SaveWindowPlacement();
                 _engine.Dispose();
+                Log.Info(reason);
+                Log.MarkSessionEnd();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Error("Shutdown failed", ex);
+            }
         }
 
         #endregion
 
         #region WinUI 3 Visual Tree Construction
 
+        /// <summary>Dark-palette colour → light-theme equivalent (backgrounds lighten, text and accents darken for contrast).</summary>
+        private static readonly Dictionary<string, string> LightPalette = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            // surfaces
+            ["#060A12"] = "#EEF2F7", ["#0D1424"] = "#FFFFFF", ["#151F35"] = "#E2E8F0", ["#0D1526"] = "#FFFFFF",
+            ["#0A1326"] = "#F8FAFC", ["#091122"] = "#F1F5F9", ["#1E293B"] = "#E2E8F0",
+            // text
+            ["#F8FAFC"] = "#0F172A", ["#94A3B8"] = "#475569",
+            // accents (darker shades keep contrast on light backgrounds)
+            ["#38BDF8"] = "#0284C7", ["#10B981"] = "#059669", ["#34D399"] = "#059669", ["#F59E0B"] = "#B45309",
+            ["#FBBF24"] = "#B45309", ["#F43F5E"] = "#E11D48", ["#A855F7"] = "#9333EA", ["#818CF8"] = "#6366F1",
+            ["#60A5FA"] = "#2563EB", ["#93C5FD"] = "#3B82F6", ["#2DD4BF"] = "#0D9488"
+        };
+
         private static SolidColorBrush BrushHex(string hex, byte alpha = 255)
         {
+            if (s_lightTheme && LightPalette.TryGetValue(hex, out var lightHex)) hex = lightHex;
             string h = hex.TrimStart('#');
             byte r = Convert.ToByte(h.Substring(0, 2), 16);
             byte g = Convert.ToByte(h.Substring(2, 2), 16);
@@ -1257,16 +1618,23 @@ namespace PulseRAM
                 RowSpacing = 12
             };
             _rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            _rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             _rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            _rootGrid.RequestedTheme = s_lightTheme ? ElementTheme.Light : ElementTheme.Dark;
 
             // 1. Top Command Header
             var topBar = BuildTopCommandBar();
             Grid.SetRow(topBar, 0);
             _rootGrid.Children.Add(topBar);
 
+            // 1b. Commit-charge warning (hidden until needed)
+            _commitBanner = BuildCommitBanner();
+            Grid.SetRow(_commitBanner, 1);
+            _rootGrid.Children.Add(_commitBanner);
+
             // 2. View Host Container
             var viewHost = new Grid();
-            Grid.SetRow(viewHost, 1);
+            Grid.SetRow(viewHost, 2);
 
             _viewOverview = BuildOverviewDashboardView();
             _viewProcesses = BuildProcessInspectorView();
@@ -1401,6 +1769,7 @@ namespace PulseRAM
             apRow.Children.Add(_apStatusPillText);
             apPill.Child = apRow;
             _apStatusPill = apPill;
+            _apStatusTip = new ToolTip();
             ToolTipService.SetToolTip(_apStatusPill, _apStatusTip);
             rightStack.Children.Add(apPill);
 
@@ -1436,7 +1805,7 @@ namespace PulseRAM
                 BorderThickness = new Thickness(1)
             };
             _adminBtn.Click += (s, e) => RequestAdminElevation();
-            _adminTip.Content = "Restart as administrator to enable standby-cache purges and page combining.";
+            _adminTip = new ToolTip { Content = "Restart as administrator to enable standby-cache purges and page combining." };
             ToolTipService.SetToolTip(_adminBtn, _adminTip);
             rightStack.Children.Add(_adminBtn);
 
@@ -1736,6 +2105,7 @@ namespace PulseRAM
 
             legGrid.Children.Add(CreateLegendCell("In Use", "#38BDF8", out _legUsedText, 0));
             var standbyCell = CreateLegendCell("Standby", "#818CF8", out _legCacheText, 1);
+            _standbyTip = new ToolTip();
             ToolTipService.SetToolTip(standbyCell, _standbyTip);
             legGrid.Children.Add(standbyCell);
             legGrid.Children.Add(CreateLegendCell("Available", "#10B981", out _legAvailText, 2));
@@ -2658,6 +3028,8 @@ namespace PulseRAM
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             var info = new StackPanel { Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
             info.Children.Add(new TextBlock { Text = "DEVICE", FontSize = 13, FontWeight = FontWeights.Bold, Foreground = BrushHex("#38BDF8") });
@@ -2690,6 +3062,14 @@ namespace PulseRAM
             opts.Children.Add(chkTray);
             opts.Children.Add(chkEco);
             opts.Children.Add(chkSmartPurge);
+            var chkCommit = new CheckBox { Content = "Memory warnings", FontSize = 12, MinWidth = 0, IsChecked = _engine.Config.CommitWarningEnabled };
+            ToolTipService.SetToolTip(chkCommit, "Warn when committed memory nears the limit (RAM + page file) — what actually makes apps crash with \"out of memory\".");
+            chkCommit.Click += (s, e) =>
+            {
+                _engine.Config.CommitWarningEnabled = chkCommit.IsChecked == true;
+                _engine.SaveConfig();
+            };
+            opts.Children.Add(chkCommit);
             info.Children.Add(opts);
             row.Children.Add(info);
 
@@ -2709,7 +3089,7 @@ namespace PulseRAM
                     RefreshAllUi(force: true);
                 }
             };
-            Grid.SetColumn(cmbUi, 1);
+            Grid.SetColumn(cmbUi, 2);
             row.Children.Add(cmbUi);
 
             var retune = new Button
@@ -2728,8 +3108,32 @@ namespace PulseRAM
                 ShowToast("Tuned for this PC",
                     $"Trigger {_engine.Config.RamThresholdPercent}% · floor {_engine.Config.MinFreeRamGb:F2} GB · cooldown {_engine.Config.CooldownSeconds / 60.0:0.#} min");
             };
-            Grid.SetColumn(retune, 2);
+            Grid.SetColumn(retune, 3);
             row.Children.Add(retune);
+
+            var cmbTheme = new ComboBox { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, MinWidth = 120 };
+            cmbTheme.Items.Add(new ComboBoxItem { Content = "Theme: System", Tag = "system" });
+            cmbTheme.Items.Add(new ComboBoxItem { Content = "Theme: Dark", Tag = "dark" });
+            cmbTheme.Items.Add(new ComboBoxItem { Content = "Theme: Light", Tag = "light" });
+            cmbTheme.SelectedIndex = Math.Max(0, Array.IndexOf(new[] { "system", "dark", "light" }, _engine.Config.Theme));
+            cmbTheme.SelectionChanged += (s, e) =>
+            {
+                if (cmbTheme.SelectedItem is ComboBoxItem item && item.Tag is string theme && theme != _engine.Config.Theme)
+                {
+                    _engine.Config.Theme = theme;
+                    _engine.SaveConfig();
+                    // Rebuild after this event returns (the combo box itself is part of the tree being replaced).
+                    DispatcherQueue.TryEnqueue(ApplyTheme);
+                }
+            };
+            Grid.SetColumn(cmbTheme, 1);
+            row.Children.Add(cmbTheme);
+
+            var logs = new Button { Content = "Logs", FontSize = 12, CornerRadius = new CornerRadius(8), VerticalAlignment = VerticalAlignment.Center };
+            ToolTipService.SetToolTip(logs, "Open the log folder (useful when reporting a problem).");
+            logs.Click += (s, e) => Log.OpenFolder();
+            Grid.SetColumn(logs, 4);
+            row.Children.Add(logs);
 
             card.Child = row;
             return card;
@@ -2853,13 +3257,7 @@ namespace PulseRAM
         private void ToggleMiniHudMode()
         {
             _isMiniHud = !_isMiniHud;
-            SwitchView("overview");
-
-            _rightColumnOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
-            _bottomSplitOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
-            _miniHudBtn.Content = new FontIcon { Glyph = _isMiniHud ? "\uE73F" : "\uE944", FontSize = 13 };
-            ToolTipService.SetToolTip(_miniHudBtn, _isMiniHud ? "Back to full view" : "Compact, always-on-top view");
-            _miniHudBtn.BorderBrush = _isMiniHud ? BrushHex("#10B981") : BrushHex("#94A3B8", 45);
+            ApplyMiniHudLayout();
 
             try
             {
@@ -2867,9 +3265,29 @@ namespace PulseRAM
                 {
                     presenter.IsAlwaysOnTop = _isMiniHud;
                 }
-                _appWindow.Resize(_isMiniHud ? new SizeInt32(430, 760) : new SizeInt32(1440, 930));
+                if (_isMiniHud)
+                {
+                    double scale = Math.Max(1.0, GetDpiForWindow(_hwnd) / 96.0);
+                    _appWindow.Resize(new SizeInt32((int)(430 * scale), (int)(760 * scale)));
+                }
+                else
+                {
+                    // Back to the user's own size (or a size that fits the screen), never a fixed 1440×930.
+                    RestoreWindowPlacement();
+                }
             }
             catch { }
+        }
+
+        /// <summary>Element states for Mini HUD on/off (also re-applied after a theme rebuild).</summary>
+        private void ApplyMiniHudLayout()
+        {
+            SwitchView("overview");
+            _rightColumnOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
+            _bottomSplitOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
+            _miniHudBtn.Content = new FontIcon { Glyph = _isMiniHud ? "\uE73F" : "\uE944", FontSize = 13 };
+            ToolTipService.SetToolTip(_miniHudBtn, _isMiniHud ? "Back to full view" : "Compact, always-on-top view");
+            _miniHudBtn.BorderBrush = _isMiniHud ? BrushHex("#10B981") : BrushHex("#94A3B8", 45);
         }
 
         private void ToggleFocusBoost()
@@ -3232,7 +3650,13 @@ namespace PulseRAM
                 _vitReclaimedSub.Text = $"{snap.OptimizationCount} sweeps";
 
                 _vitCommitVal.Text = $"{snap.CommitTotalGb:F1} / {snap.CommitLimitGb:F1} GB";
-                _vitCommitSub.Text = $"{snap.CommitPercent:F0}% used";
+                _vitCommitSub.Text = snap.CommitLevel == "ok" ? $"{snap.CommitPercent:F0}% used" : $"{snap.CommitPercent:F0}% used — near the limit";
+                _vitCommitVal.Foreground = BrushHex(snap.CommitLevel == "critical" ? "#F43F5E" : (snap.CommitLevel == "high" ? "#F59E0B" : "#F8FAFC"));
+                if (snap.CommitLevel == "ok" && _commitBanner.Visibility == Visibility.Visible)
+                {
+                    _commitBanner.Visibility = Visibility.Collapsed;
+                    _commitAdvice = null;
+                }
 
                 _vitPagefileVal.Text = snap.PagefileTotalGb > 0.05 ? $"{snap.PagefileUsedGb:F2} GB" : "0.00 GB";
                 _vitPagefileSub.Text = snap.PagefileTotalGb > 0.05
@@ -3606,7 +4030,7 @@ namespace PulseRAM
                 SecondaryButtonText = "Remove Cap",
                 CloseButtonText = "Cancel",
                 DefaultButton = ContentDialogButton.Primary,
-                RequestedTheme = ElementTheme.Dark,
+                RequestedTheme = s_lightTheme ? ElementTheme.Light : ElementTheme.Dark,
                 XamlRoot = _rootGrid.XamlRoot
             };
 
