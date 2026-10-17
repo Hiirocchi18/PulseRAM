@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
@@ -15,13 +17,90 @@ namespace PulseRAM
         private static PulseRamApp? _appInstance;
         public static MainWindow? ActiveMainWindow;
 
+        /// <summary>Broadcast by a second launch so the running instance shows its window.</summary>
+        public const string ShowWindowMessageName = "PulseRAM.ShowMainWindow.v1";
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint RegisterWindowMessage(string lpString);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
+
+        /// <summary>Broadcast by the installer so a running (possibly elevated) instance thaws apps and exits cleanly.</summary>
+        public const string ExitForInstallerMessageName = "PulseRAM.ExitForInstaller.v1";
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool AllowSetForegroundWindow(int dwProcessId);
+
+        private const int ASFW_ANY = -1;
+
+        private static bool HasArg(string[] args, string name) =>
+            args.Any(a => string.Equals(a, name, StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>
+        /// Already running (often hidden in the tray): bring that window forward instead of exiting silently.
+        /// A --tray launch (e.g. a leftover startup entry) stays silent.
+        /// </summary>
+        private static void SignalExistingInstance(string[] args)
+        {
+            if (HasArg(args, "--tray")) return;
+            try
+            {
+                // We are the foreground process (the user just launched us); hand that right to the running
+                // instance so its SetForegroundWindow actually works instead of only flashing the taskbar.
+                AllowSetForegroundWindow(ASFW_ANY);
+                uint msg = RegisterWindowMessage(ShowWindowMessageName);
+                if (msg != 0) PostMessage(HWND_BROADCAST, msg, IntPtr.Zero, IntPtr.Zero);
+            }
+            catch { }
+        }
+
         [STAThread]
         public static void Main(string[] args)
         {
-            _singleInstanceMutex = new Mutex(true, @"Local\PulseRAM_WinUI3_SingleInstance", out bool createdNew);
+            args ??= Array.Empty<string>();
+
+            // Used by the installer before upgrading/uninstalling: resume anything PulseRAM suspended.
+            if (HasArg(args, "--thaw-frozen"))
+            {
+                NativeMemoryEngine.RecoverFrozenProcesses();
+                return;
+            }
+
+            bool createdNew;
+            try
+            {
+                _singleInstanceMutex = new Mutex(true, @"Local\PulseRAM_WinUI3_SingleInstance", out createdNew);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // An elevated instance owns the mutex and its default DACL denies us: it is running.
+                SignalExistingInstance(args);
+                return;
+            }
+
             if (!createdNew)
             {
-                return;
+                if (HasArg(args, "--elevated-relaunch"))
+                {
+                    // The non-elevated instance that launched us is closing; wait for it to release the mutex.
+                    try
+                    {
+                        if (!_singleInstanceMutex.WaitOne(TimeSpan.FromSeconds(15)))
+                            return;
+                    }
+                    catch (AbandonedMutexException)
+                    {
+                        // Previous instance exited without releasing it; we now own the mutex.
+                    }
+                }
+                else
+                {
+                    SignalExistingInstance(args);
+                    return;
+                }
             }
 
             WinRT.ComWrappersSupport.InitializeComWrappers();

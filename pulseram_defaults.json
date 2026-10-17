@@ -1,0 +1,120 @@
+{
+  "ConfigVersion": 2,
+  "AutoEnabled": true,
+  "RamThresholdPercent": 80,
+  "MinFreeRamGb": 1.0,
+  "CooldownSeconds": 120,
+  "AutoMode": "smart",
+  "ProtectForeground": true,
+  "IdleCpuCeilingPercent": 2.5,
+  "MinProcessWorkingSetMb": 15.0,
+  "PauseOnHighCpu": true,
+  "CpuGuardPercent": 75.0,
+  "AutoLeakRemediation": true,
+  "LeakVelocityThresholdMbMin": 120.0,
+  "LeakGuardCooldownSeconds": 300,
+  "CapGuardCooldownSeconds": 60,
+  "ScheduledTrimEnabled": false,
+  "ScheduledIntervalMinutes": 15,
+  "AutoSoundChime": false,
+  "FocusBoostActive": false,
+  "FocusBoostThresholdPercent": 62,
+  "ProfilesAutoSwitch": true,
+  "ForcedProfileId": "",
+  "HotkeysEnabled": true,
+  "HotkeyPrimary": "Ctrl+Alt+Shift+M",
+  "HotkeySecondary": "Ctrl+Alt+Shift+P",
+  "ProtectedApps": [
+    "dwm.exe",
+    "audiodg.exe",
+    "explorer.exe"
+  ],
+  "EcoApps": [],
+  "AppMemoryCapsMb": {},
+  "Profiles": [
+    {
+      "Id": "gaming-boost",
+      "Name": "Gaming Boost",
+      "Description": "Trims idle background apps on game launch, shields the game process, and sweeps at 68%.",
+      "MatchExes": [
+        "cs2.exe",
+        "valorant.exe",
+        "valorant-win64-shipping.exe",
+        "fortniteclient-win64-shipping.exe",
+        "eldenring.exe",
+        "genshinimpact.exe",
+        "starrail.exe",
+        "robloxplayerbeta.exe",
+        "dota2.exe",
+        "league of legends.exe",
+        "r5apex.exe",
+        "cyberpunk2077.exe",
+        "helldivers2.exe",
+        "overwatch.exe",
+        "javaw.exe",
+        "minecraft.windows.exe"
+      ],
+      "RamThresholdPercent": 68,
+      "AutoMode": "smart",
+      "AutoShieldMatched": true,
+      "BoostOnLaunch": true,
+      "Enabled": true
+    },
+    {
+      "Id": "creator-studio",
+      "Name": "Creator & 3D Studio",
+      "Description": "Shields active rendering/editing apps while trimming idle background apps at 72%.",
+      "MatchExes": [
+        "blender.exe",
+        "afterfx.exe",
+        "adobe premiere pro.exe",
+        "photoshop.exe",
+        "resolve.exe",
+        "unrealeditor.exe",
+        "unity.exe",
+        "obs64.exe"
+      ],
+      "RamThresholdPercent": 72,
+      "AutoMode": "smart",
+      "AutoShieldMatched": true,
+      "BoostOnLaunch": true,
+      "Enabled": true
+    },
+    {
+      "Id": "dev-workstation",
+      "Name": "Dev & Local AI",
+      "Description": "Shields your IDE and local LLM runners while trimming idle helpers at 76%.",
+      "MatchExes": [
+        "code.exe",
+        "devenv.exe",
+        "idea64.exe",
+        "pycharm64.exe",
+        "ollama.exe",
+        "lm-studio.exe",
+        "docker.exe"
+      ],
+      "RamThresholdPercent": 76,
+      "AutoMode": "smart",
+      "AutoShieldMatched": true,
+      "BoostOnLaunch": false,
+      "Enabled": true
+    },
+    {
+      "Id": "browser-tamer",
+      "Name": "Browser Tab Tamer",
+      "Description": "Trims idle browser subprocesses when total memory passes 78%.",
+      "MatchExes": [
+        "chrome.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "brave.exe",
+        "opera.exe"
+      ],
+      "RamThresholdPercent": 78,
+      "AutoMode": "smart",
+      "AutoShieldMatched": false,
+      "BoostOnLaunch": false,
+      "Enabled": true
+    }
+  ]
+}

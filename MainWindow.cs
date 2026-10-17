@@ -74,6 +74,20 @@ namespace PulseRAM
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern bool Shell_NotifyIcon(uint dwMessage, ref NOTIFYICONDATA lpData);
 
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint RegisterWindowMessage(string lpString);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool ChangeWindowMessageFilterEx(IntPtr hWnd, uint message, uint action, IntPtr pChangeFilterStruct);
+
+        private const uint MSGFLT_ALLOW = 1;
+
         [StructLayout(LayoutKind.Sequential)]
         private struct POINT { public int X; public int Y; }
 
@@ -108,8 +122,10 @@ namespace PulseRAM
         private const uint IMAGE_ICON = 1;
         private const uint LR_LOADFROMFILE = 0x00000010;
 
+        private const uint MOD_ALT = 0x0001;
         private const uint MOD_CONTROL = 0x0002;
         private const uint MOD_SHIFT = 0x0004;
+        private const uint MOD_WIN = 0x0008;
         private const uint MOD_NOREPEAT = 0x4000;
 
         private const uint NIM_ADD = 0x00000000;
@@ -135,6 +151,15 @@ namespace PulseRAM
         private IntPtr _customHIcon = IntPtr.Zero;
         private NOTIFYICONDATA _trayData;
         private bool _trayInitialized = false;
+        private uint _showWindowMsg = 0;
+        private uint _taskbarCreatedMsg = 0;
+        private uint _exitForInstallerMsg = 0;
+        private bool _animationsPaused = false;
+        /// <summary>No ambient animation and a snapping gauge: lite mode, or Windows "Animation effects" is off.</summary>
+        private bool _reduceMotion = false;
+        private string _hotkeyPrimaryLabel = "";
+        private string _hotkeySecondaryLabel = "";
+        private string _hotkeyStatus = "";
 
         private readonly DispatcherQueueTimer _uiTimer;
         private readonly DispatcherQueueTimer _gaugeAnimTimer;
@@ -179,6 +204,9 @@ namespace PulseRAM
         private Button _focusBoostBtn = null!;
         private TextBlock _apStatusPillText = null!;
         private Ellipse _apStatusDot = null!;
+        private Border _apStatusPill = null!;
+        private readonly ToolTip _apStatusTip = new ToolTip();
+        private readonly ToolTip _adminTip = new ToolTip();
         private TextBlock _sessionFreedTopText = null!;
         private Button _miniHudBtn = null!;
         private Button _adminBtn = null!;
@@ -272,7 +300,7 @@ namespace PulseRAM
         public MainWindow(string[] args)
         {
             _launchArgs = args ?? Array.Empty<string>();
-            Title = "PulseRAM — Intelligent Kernel Memory Optimizer (WinUI 3)";
+            Title = "PulseRAM";
             _engine = new NativeMemoryEngine();
             _engine.OnOptimizationCompleted += OnEngineOptimizationCompleted;
 
@@ -285,8 +313,8 @@ namespace PulseRAM
 
             Closed += OnMainWindowClosed;
 
-            // Initial UI Render
-            RefreshAllUi();
+            // Initial UI Render (forced: the window is not visible yet)
+            RefreshAllUi(force: true);
 
             // 60 FPS Smooth Gauge & Counter Interpolation Timer
             _gaugeAnimTimer = DispatcherQueue.CreateTimer();
@@ -299,6 +327,8 @@ namespace PulseRAM
             _uiTimer.Interval = TimeSpan.FromMilliseconds(1500);
             _uiTimer.Tick += (s, e) => RefreshAllUi();
             _uiTimer.Start();
+
+            ApplyPerformanceMode();
         }
 
         public void InitializeNativeHooksAfterActivate()
@@ -309,6 +339,18 @@ namespace PulseRAM
                 _wndProcDelegate = CustomWndProc;
                 _oldWndProc = SetWindowLongPtr(_hwnd, GWLP_WNDPROC, Marshal.GetFunctionPointerForDelegate(_wndProcDelegate));
 
+                // A second launch broadcasts this message so we can bring the existing window forward.
+                // Allow it through UIPI in case this instance is elevated and the new one is not.
+                _showWindowMsg = RegisterWindowMessage(Program.ShowWindowMessageName);
+                if (_showWindowMsg != 0) ChangeWindowMessageFilterEx(_hwnd, _showWindowMsg, MSGFLT_ALLOW, IntPtr.Zero);
+                // Explorer broadcasts TaskbarCreated after it restarts; the tray icon must be re-added then.
+                _taskbarCreatedMsg = RegisterWindowMessage("TaskbarCreated");
+                if (_taskbarCreatedMsg != 0) ChangeWindowMessageFilterEx(_hwnd, _taskbarCreatedMsg, MSGFLT_ALLOW, IntPtr.Zero);
+                // The (non-elevated) installer asks us to exit cleanly so frozen apps are thawed first;
+                // taskkill alone cannot stop an elevated instance.
+                _exitForInstallerMsg = RegisterWindowMessage(Program.ExitForInstallerMessageName);
+                if (_exitForInstallerMsg != 0) ChangeWindowMessageFilterEx(_hwnd, _exitForInstallerMsg, MSGFLT_ALLOW, IntPtr.Zero);
+
                 InitializeSystemTrayIcon();
                 RegisterGlobalHotkeys();
                 StartAmbientXamlAnimations();
@@ -316,12 +358,15 @@ namespace PulseRAM
                 if (_launchArgs.Any(a => string.Equals(a, "--tray", StringComparison.OrdinalIgnoreCase)))
                 {
                     ShowWindow(_hwnd, 0);
+                    RefreshAllUi(); // pauses animations while hidden
                 }
                 else
                 {
-                    ShowWindow(_hwnd, 9); // SW_RESTORE
-                    SetForegroundWindow(_hwnd);
+                    ShowMainWindow();
                 }
+
+                if (!string.IsNullOrEmpty(_hotkeyStatus))
+                    ShowToast("Hotkey unavailable", _hotkeyStatus);
             }
             catch { }
         }
@@ -330,7 +375,7 @@ namespace PulseRAM
         {
             try
             {
-                _appWindow.Title = "PulseRAM — Intelligent Kernel Memory Optimizer (WinUI 3)";
+                _appWindow.Title = "PulseRAM";
             }
             catch { }
 
@@ -401,6 +446,22 @@ namespace PulseRAM
 
         private void StartAmbientXamlAnimations()
         {
+            // Ambient loops are skipped entirely in reduce-motion / lite mode (re-started if the user picks Full).
+            if (_reduceMotion || _reactorBreathingStoryboard != null) return;
+            StartAmbientXamlAnimationsCore();
+            // Keep the storyboards consistent with the current paused state (e.g. launched hidden with --tray).
+            if (_animationsPaused)
+            {
+                foreach (var sb in new[] { _reactorBreathingStoryboard, _reactorOrbitalStoryboard, _logoPulseStoryboard })
+                {
+                    try { sb?.Pause(); } catch { }
+                }
+            }
+        }
+
+        private void StartAmbientXamlAnimationsCore()
+        {
+
             try
             {
                 // 1. Reactor Halo Breathing Animation (Scale + Opacity)
@@ -457,6 +518,7 @@ namespace PulseRAM
 
         private void TriggerReactorShockwaveAnimation()
         {
+            if (_reduceMotion) return;
             try
             {
                 _reactorShockwaveRing.Visibility = Visibility.Visible;
@@ -539,11 +601,13 @@ namespace PulseRAM
             catch { }
         }
 
-        private void OnGaugeAnimationFrame(DispatcherQueueTimer sender, object args)
+        private void OnGaugeAnimationFrame(DispatcherQueueTimer sender, object args) => StepGauge(0.16);
+
+        /// <summary>Moves the gauge toward its targets; factor 1.0 jumps straight there (reduce-motion).</summary>
+        private void StepGauge(double lerp)
         {
             try
             {
-                const double lerp = 0.16;
                 bool changed = false;
 
                 if (Math.Abs(_targetPercent - _displayedPercent) > 0.05)
@@ -598,7 +662,7 @@ namespace PulseRAM
                     uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
                     uCallbackMessage = WM_USER_TRAY,
                     hIcon = iconHandle,
-                    szTip = "PulseRAM — WinUI 3 Kernel Memory Optimizer",
+                    szTip = "PulseRAM",
                     szInfo = "",
                     szInfoTitle = ""
                 };
@@ -619,19 +683,88 @@ namespace PulseRAM
             catch { }
         }
 
+        /// <summary>
+        /// Parses "Ctrl+Alt+Shift+M" style strings (modifiers: Ctrl/Control, Alt, Shift, Win; key: A–Z, 0–9, F1–F24).
+        /// </summary>
+        private static bool TryParseHotkey(string? text, out uint modifiers, out uint vk, out string label)
+        {
+            modifiers = 0;
+            vk = 0;
+            label = "";
+            if (string.IsNullOrWhiteSpace(text)) return false;
+
+            var parts = text.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (parts.Length < 2) return false;
+
+            var labels = new List<string>();
+            for (int i = 0; i < parts.Length - 1; i++)
+            {
+                switch (parts[i].ToLowerInvariant())
+                {
+                    case "ctrl": case "control": modifiers |= MOD_CONTROL; break;
+                    case "alt": modifiers |= MOD_ALT; break;
+                    case "shift": modifiers |= MOD_SHIFT; break;
+                    case "win": case "windows": modifiers |= MOD_WIN; break;
+                    default: return false;
+                }
+            }
+            if (modifiers == 0) return false;
+            if ((modifiers & MOD_CONTROL) != 0) labels.Add("Ctrl");
+            if ((modifiers & MOD_ALT) != 0) labels.Add("Alt");
+            if ((modifiers & MOD_SHIFT) != 0) labels.Add("Shift");
+            if ((modifiers & MOD_WIN) != 0) labels.Add("Win");
+
+            string key = parts[^1].ToUpperInvariant();
+            if (key.Length == 1 && ((key[0] >= 'A' && key[0] <= 'Z') || (key[0] >= '0' && key[0] <= '9')))
+            {
+                vk = key[0];
+            }
+            else if (key.Length >= 2 && key[0] == 'F' && int.TryParse(key.Substring(1), out int fn) && fn >= 1 && fn <= 24)
+            {
+                vk = (uint)(0x70 + fn - 1); // VK_F1..VK_F24
+            }
+            else
+            {
+                return false;
+            }
+            labels.Add(key);
+            label = string.Join(" + ", labels);
+            return true;
+        }
+
         private void RegisterGlobalHotkeys()
         {
+            _hotkeyStatus = "";
+            bool p1 = TryParseHotkey(_engine.Config.HotkeyPrimary, out uint m1, out uint vk1, out _hotkeyPrimaryLabel);
+            bool p2 = TryParseHotkey(_engine.Config.HotkeySecondary, out uint m2, out uint vk2, out _hotkeySecondaryLabel);
+            if (!p1) _hotkeyPrimaryLabel = $"Invalid: {_engine.Config.HotkeyPrimary}";
+            if (!p2) _hotkeySecondaryLabel = $"Invalid: {_engine.Config.HotkeySecondary}";
+
             try
             {
                 UnregisterHotKey(_hwnd, 9001);
                 UnregisterHotKey(_hwnd, 9002);
-                if (_engine.Config.HotkeysEnabled)
-                {
-                    RegisterHotKey(_hwnd, 9001, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 0x4D); // Ctrl+Shift+M
-                    RegisterHotKey(_hwnd, 9002, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 0x50); // Ctrl+Shift+P
-                }
+                if (!_engine.Config.HotkeysEnabled) return;
+
+                var problems = new List<string>();
+                if (!p1) problems.Add($"\"{_engine.Config.HotkeyPrimary}\" is not a valid hotkey");
+                else if (!RegisterHotKey(_hwnd, 9001, m1 | MOD_NOREPEAT, vk1)) problems.Add($"{_hotkeyPrimaryLabel} is already used by another app");
+                if (!p2) problems.Add($"\"{_engine.Config.HotkeySecondary}\" is not a valid hotkey");
+                else if (!RegisterHotKey(_hwnd, 9002, m2 | MOD_NOREPEAT, vk2)) problems.Add($"{_hotkeySecondaryLabel} is already used by another app");
+
+                if (problems.Count > 0)
+                    _hotkeyStatus = string.Join("; ", problems) +
+                        $". Change HotkeyPrimary / HotkeySecondary in {System.IO.Path.Combine(NativeMemoryEngine.DataDirectory, "pulseram_config.json")}.";
             }
             catch { }
+        }
+
+        /// <summary>Shows, restores and focuses the dashboard, then renders it immediately.</summary>
+        public void ShowMainWindow()
+        {
+            ShowWindow(_hwnd, 9); // SW_RESTORE
+            SetForegroundWindow(_hwnd);
+            RefreshAllUi(force: true);
         }
 
         private IntPtr CustomWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
@@ -641,11 +774,11 @@ namespace PulseRAM
                 int id = wParam.ToInt32();
                 if (id == 9001)
                 {
-                    DispatcherQueue.TryEnqueue(() => RunOptimizationAsync("smart", "Global Hotkey (Ctrl+Shift+M)"));
+                    DispatcherQueue.TryEnqueue(() => RunOptimizationAsync("smart", $"Global Hotkey ({_hotkeyPrimaryLabel})"));
                 }
                 else if (id == 9002)
                 {
-                    DispatcherQueue.TryEnqueue(() => RunOptimizationAsync("deep", "Global Hotkey (Ctrl+Shift+P)"));
+                    DispatcherQueue.TryEnqueue(() => RunOptimizationAsync("deep", $"Global Hotkey ({_hotkeySecondaryLabel})"));
                 }
             }
             else if (msg == WM_USER_TRAY)
@@ -653,13 +786,28 @@ namespace PulseRAM
                 uint mouseMsg = (uint)(lParam.ToInt64() & 0xFFFF);
                 if (mouseMsg == WM_LBUTTONDBLCLK)
                 {
-                    ShowWindow(_hwnd, 9);
-                    SetForegroundWindow(_hwnd);
+                    ShowMainWindow();
                 }
                 else if (mouseMsg == WM_RBUTTONUP)
                 {
                     ShowTrayContextMenu();
                 }
+            }
+            else if (_showWindowMsg != 0 && msg == _showWindowMsg)
+            {
+                DispatcherQueue.TryEnqueue(ShowMainWindow);
+                return IntPtr.Zero;
+            }
+            else if (_exitForInstallerMsg != 0 && msg == _exitForInstallerMsg)
+            {
+                DispatcherQueue.TryEnqueue(Close);
+                return IntPtr.Zero;
+            }
+            else if (_taskbarCreatedMsg != 0 && msg == _taskbarCreatedMsg)
+            {
+                // Explorer restarted: the old icon is gone, add it again.
+                _trayInitialized = false;
+                InitializeSystemTrayIcon();
             }
             return CallWindowProc(_oldWndProc, hWnd, msg, wParam, lParam);
         }
@@ -672,8 +820,10 @@ namespace PulseRAM
             {
                 AppendMenu(hMenu, MF_STRING, new UIntPtr(1), "Open PulseRAM Dashboard");
                 AppendMenu(hMenu, MF_SEPARATOR, UIntPtr.Zero, "");
-                AppendMenu(hMenu, MF_STRING, new UIntPtr(2), "Smart Trim RAM Now (Ctrl+Shift+M)");
-                AppendMenu(hMenu, MF_STRING, new UIntPtr(3), "Deep Sweep + Standby Purge (Ctrl+Shift+P)");
+                string hk1 = _engine.Config.HotkeysEnabled ? $" ({_hotkeyPrimaryLabel})" : "";
+                string hk2 = _engine.Config.HotkeysEnabled ? $" ({_hotkeySecondaryLabel})" : "";
+                AppendMenu(hMenu, MF_STRING, new UIntPtr(2), $"Smart Trim Idle Apps Now{hk1}");
+                AppendMenu(hMenu, MF_STRING, new UIntPtr(3), $"Deep Sweep Now{hk2}");
                 AppendMenu(hMenu, MF_STRING, new UIntPtr(4), _engine.Config.FocusBoostActive ? "Disable Focus Boost Overdrive" : "Enable Focus Boost Overdrive (62%)");
                 AppendMenu(hMenu, MF_STRING, new UIntPtr(5), "Thaw All Frozen Processes");
                 AppendMenu(hMenu, MF_SEPARATOR, UIntPtr.Zero, "");
@@ -685,8 +835,7 @@ namespace PulseRAM
                 switch (cmd)
                 {
                     case 1:
-                        ShowWindow(_hwnd, 9);
-                        SetForegroundWindow(_hwnd);
+                        ShowMainWindow();
                         break;
                     case 2:
                         DispatcherQueue.TryEnqueue(() => RunOptimizationAsync("smart", "System Tray Quick Trim"));
@@ -910,28 +1059,7 @@ namespace PulseRAM
                 FontWeight = FontWeights.ExtraBold,
                 Foreground = BrushHex("#F8FAFC")
             });
-            titleLine.Children.Add(new Border
-            {
-                Background = BrushHex("#38BDF8", 35),
-                BorderBrush = BrushHex("#38BDF8", 110),
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(99),
-                Padding = new Thickness(7, 1, 7, 1),
-                Child = new TextBlock
-                {
-                    Text = "WINUI 3 · NT KERNEL",
-                    FontSize = 9.5,
-                    FontWeight = FontWeights.Bold,
-                    Foreground = BrushHex("#38BDF8")
-                }
-            });
             titleStack.Children.Add(titleLine);
-            titleStack.Children.Add(new TextBlock
-            {
-                Text = "Native C# Windows SDK RAM Optimizer & Process Governor",
-                FontSize = 11,
-                Foreground = BrushHex("#94A3B8")
-            });
             brandRow.Children.Add(titleStack);
             Grid.SetColumn(brandRow, 0);
             grid.Children.Add(brandRow);
@@ -949,10 +1077,10 @@ namespace PulseRAM
             };
             var navStack = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
 
-            _tabBtnOverview = CreateNavTabButton("Dashboard", true, () => SwitchView("overview"));
+            _tabBtnOverview = CreateNavTabButton("Overview", true, () => SwitchView("overview"));
 
             var procTabContent = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-            procTabContent.Children.Add(new TextBlock { Text = "Process Inspector", FontWeight = FontWeights.SemiBold, FontSize = 12.5 });
+            procTabContent.Children.Add(new TextBlock { Text = "Processes", FontWeight = FontWeights.SemiBold, FontSize = 12.5 });
             _tabProcCountText = new TextBlock { Text = "0", FontSize = 11, Foreground = BrushHex("#38BDF8"), FontWeight = FontWeights.Bold };
             procTabContent.Children.Add(_tabProcCountText);
             _tabBtnProcesses = new Button
@@ -965,7 +1093,7 @@ namespace PulseRAM
             };
             _tabBtnProcesses.Click += (s, e) => SwitchView("processes");
 
-            _tabBtnProfiles = CreateNavTabButton("Profiles & Hotkeys", false, () => SwitchView("profiles"));
+            _tabBtnProfiles = CreateNavTabButton("Profiles", false, () => SwitchView("profiles"));
 
             navStack.Children.Add(_tabBtnOverview);
             navStack.Children.Add(_tabBtnProcesses);
@@ -985,7 +1113,7 @@ namespace PulseRAM
 
             _focusBoostBtn = new Button
             {
-                Content = "⚡ Focus Boost: OFF",
+                Content = "⚡ Focus",
                 FontSize = 11.5,
                 FontWeight = FontWeights.SemiBold,
                 CornerRadius = new CornerRadius(99),
@@ -995,6 +1123,7 @@ namespace PulseRAM
                 BorderThickness = new Thickness(1)
             };
             _focusBoostBtn.Click += (s, e) => ToggleFocusBoost();
+            ToolTipService.SetToolTip(_focusBoostBtn, "Focus Boost: temporarily lowers the Auto-Pilot trigger to 62% and trims idle apps now.");
             rightStack.Children.Add(_focusBoostBtn);
 
             // Active Auto-Pilot Pill
@@ -1009,33 +1138,20 @@ namespace PulseRAM
             };
             var apRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, VerticalAlignment = VerticalAlignment.Center };
             _apStatusDot = new Ellipse { Width = 8, Height = 8, Fill = BrushHex("#10B981") };
-            _apStatusPillText = new TextBlock { Text = "Auto-Pilot: 80%", FontSize = 11.5, FontWeight = FontWeights.SemiBold, Foreground = BrushHex("#F8FAFC") };
+            _apStatusPillText = new TextBlock { Text = "Auto 80%", FontSize = 11.5, FontWeight = FontWeights.SemiBold, Foreground = BrushHex("#F8FAFC") };
             apRow.Children.Add(_apStatusDot);
             apRow.Children.Add(_apStatusPillText);
             apPill.Child = apRow;
+            _apStatusPill = apPill;
+            ToolTipService.SetToolTip(_apStatusPill, _apStatusTip);
             rightStack.Children.Add(apPill);
 
-            // Session Reclaimed Pill
-            var freedPill = new Border
-            {
-                Background = BrushHex("#151F35", 190),
-                BorderBrush = BrushHex("#10B981", 65),
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(99),
-                Padding = new Thickness(11, 5, 11, 5),
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            var freedRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5 };
-            freedRow.Children.Add(new TextBlock { Text = "Freed:", FontSize = 11.5, Foreground = BrushHex("#94A3B8") });
-            _sessionFreedTopText = new TextBlock { Text = "0 MB", FontSize = 11.5, FontWeight = FontWeights.Bold, Foreground = BrushHex("#34D399") };
-            freedRow.Children.Add(_sessionFreedTopText);
-            freedPill.Child = freedRow;
-            rightStack.Children.Add(freedPill);
+            _sessionFreedTopText = new TextBlock(); // shown on the TRIMMED card instead
 
             // Mini HUD Toggle
             _miniHudBtn = new Button
             {
-                Content = "Mini HUD",
+                Content = new FontIcon { Glyph = "\uE944", FontSize = 13 },
                 FontSize = 11.5,
                 FontWeight = FontWeights.SemiBold,
                 CornerRadius = new CornerRadius(99),
@@ -1045,12 +1161,13 @@ namespace PulseRAM
                 BorderThickness = new Thickness(1)
             };
             _miniHudBtn.Click += (s, e) => ToggleMiniHudMode();
+            ToolTipService.SetToolTip(_miniHudBtn, "Compact, always-on-top view");
             rightStack.Children.Add(_miniHudBtn);
 
             // Admin Button
             _adminBtn = new Button
             {
-                Content = "Unlock Kernel Admin",
+                Content = "Admin",
                 FontSize = 11.5,
                 FontWeight = FontWeights.Bold,
                 CornerRadius = new CornerRadius(99),
@@ -1061,6 +1178,8 @@ namespace PulseRAM
                 BorderThickness = new Thickness(1)
             };
             _adminBtn.Click += (s, e) => RequestAdminElevation();
+            _adminTip.Content = "Restart as administrator to enable standby-cache purges and page combining.";
+            ToolTipService.SetToolTip(_adminBtn, _adminTip);
             rightStack.Children.Add(_adminBtn);
 
             Grid.SetColumn(rightStack, 3);
@@ -1161,7 +1280,7 @@ namespace PulseRAM
             hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             hdr.Children.Add(new TextBlock
             {
-                Text = "MEMORY REACTOR",
+                Text = "MEMORY",
                 FontSize = 12,
                 FontWeight = FontWeights.Bold,
                 Foreground = BrushHex("#38BDF8")
@@ -1327,7 +1446,7 @@ namespace PulseRAM
             var mapHdr = new Grid();
             mapHdr.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             mapHdr.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            mapHdr.Children.Add(new TextBlock { Text = "Physical Memory Map", FontSize = 11, Foreground = BrushHex("#94A3B8") });
+            mapHdr.Children.Add(new TextBlock { Text = "RAM", FontSize = 11, Foreground = BrushHex("#94A3B8") });
             _availSummaryText = new TextBlock { Text = "-- GB Available", FontSize = 11.5, FontWeight = FontWeights.Bold, Foreground = BrushHex("#F8FAFC") };
             Grid.SetColumn(_availSummaryText, 1);
             mapHdr.Children.Add(_availSummaryText);
@@ -1358,7 +1477,7 @@ namespace PulseRAM
             legGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
             legGrid.Children.Add(CreateLegendCell("In Use", "#38BDF8", out _legUsedText, 0));
-            legGrid.Children.Add(CreateLegendCell("Standby Cache", "#818CF8", out _legCacheText, 1));
+            legGrid.Children.Add(CreateLegendCell("Standby", "#818CF8", out _legCacheText, 1));
             legGrid.Children.Add(CreateLegendCell("Available", "#10B981", out _legAvailText, 2));
             mapStack.Children.Add(legGrid);
             mapBox.Child = mapStack;
@@ -1367,7 +1486,7 @@ namespace PulseRAM
             // 4 Cleaning Mode Selector Cards (2x2 Grid)
             stack.Children.Add(new TextBlock
             {
-                Text = "CLEANING INTELLIGENCE MODE",
+                Text = "MODE",
                 FontSize = 10.5,
                 FontWeight = FontWeights.Bold,
                 Foreground = BrushHex("#94A3B8")
@@ -1379,17 +1498,17 @@ namespace PulseRAM
             modeGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             modeGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            AddModeCard(modeGrid, "smart", "Smart Trim", "Safe", "Idle background bloat only.", 0, 0);
-            AddModeCard(modeGrid, "deep", "Deep Sweep", "Thorough", "All eligible working sets.", 0, 1);
-            AddModeCard(modeGrid, "standby", "Standby Purge", "Kernel", "Flushes OS Standby Cache.", 1, 0);
-            AddModeCard(modeGrid, "max", "Max Overdrive", "Extreme", "Full RAM + Page Combine.", 1, 1);
+            AddModeCard(modeGrid, "smart", "Smart", "Safe", "Trims idle background apps only. Never touches the active window or shielded apps.", 0, 0);
+            AddModeCard(modeGrid, "deep", "Deep", "", "Trims every unshielded app. As administrator, also purges the low-priority standby cache and combines identical pages.", 0, 1);
+            AddModeCard(modeGrid, "standby", "Standby", "Admin", "Empties the Windows standby cache and flushes modified pages. Requires administrator.", 1, 0);
+            AddModeCard(modeGrid, "max", "Max", "Admin", "Deep trim + page combining + full standby purge. The kernel part requires administrator.", 1, 1);
             stack.Children.Add(modeGrid);
 
             // Primary Optimize Now Button
             var ctaStack = new StackPanel { Spacing = 2, HorizontalAlignment = HorizontalAlignment.Center };
             _optimizeBtnLabel = new TextBlock
             {
-                Text = "⚡ Smart Trim RAM Now",
+                Text = "⚡ Clean · Smart",
                 FontSize = 14.5,
                 FontWeight = FontWeights.ExtraBold,
                 Foreground = BrushHex("#FFFFFF"),
@@ -1397,7 +1516,7 @@ namespace PulseRAM
             };
             _optimizeBtnSub = new TextBlock
             {
-                Text = "Est. Reclaimable: -- MB",
+                Text = "--",
                 FontSize = 11,
                 Foreground = BrushHex("#E0F2FE"),
                 HorizontalAlignment = HorizontalAlignment.Center
@@ -1429,7 +1548,7 @@ namespace PulseRAM
             };
             _lastSweepSummaryText = new TextBlock
             {
-                Text = "Last Sweep: Ready — Auto-Pilot armed & monitoring",
+                Text = "Ready",
                 FontSize = 11,
                 Foreground = BrushHex("#94A3B8"),
                 TextTrimming = TextTrimming.CharacterEllipsis
@@ -1476,8 +1595,8 @@ namespace PulseRAM
             top.Children.Add(tagTxt);
 
             sp.Children.Add(top);
-            sp.Children.Add(new TextBlock { Text = desc, FontSize = 10.5, Foreground = BrushHex("#94A3B8"), TextWrapping = TextWrapping.Wrap });
             border.Child = sp;
+            ToolTipService.SetToolTip(border, desc);
 
             border.PointerPressed += (s, e) => SelectCleaningMode(modeKey);
             _modeCards[modeKey] = border;
@@ -1497,14 +1616,14 @@ namespace PulseRAM
             hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             hdr.Children.Add(new TextBlock
             {
-                Text = "60-SECOND REAL-TIME MEMORY & CPU TELEMETRY",
+                Text = "LAST 60 S",
                 FontSize = 12,
                 FontWeight = FontWeights.Bold,
                 Foreground = BrushHex("#38BDF8")
             });
             _chartMetaText = new TextBlock
             {
-                Text = "Cyan: RAM % · Green: CPU % · Red Line: Trigger Ceiling",
+                Text = "RAM · CPU · trigger",
                 FontSize = 11,
                 Foreground = BrushHex("#94A3B8")
             };
@@ -1533,12 +1652,12 @@ namespace PulseRAM
             vitalsGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             vitalsGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-            vitalsGrid.Children.Add(CreateVitalCard("SESSION RECLAIMED", "#34D399", out _vitReclaimedVal, out _vitReclaimedSub, 0, 0));
-            vitalsGrid.Children.Add(CreateVitalCard("COMMIT CHARGE", "#F8FAFC", out _vitCommitVal, out _vitCommitSub, 0, 1));
-            vitalsGrid.Children.Add(CreateVitalCard("PAGEFILE / SWAP", "#F8FAFC", out _vitPagefileVal, out _vitPagefileSub, 0, 2));
-            vitalsGrid.Children.Add(CreateVitalCard("KERNEL POOLS", "#F8FAFC", out _vitKernelVal, out _vitKernelSub, 1, 0));
-            vitalsGrid.Children.Add(CreateVitalCard("CPU & THREADS", "#38BDF8", out _vitCpuVal, out _vitCpuSub, 1, 1));
-            vitalsGrid.Children.Add(CreateVitalCard("GOVERNOR STATUS", "#A855F7", out _vitGovVal, out _vitGovSub, 1, 2));
+            vitalsGrid.Children.Add(CreateVitalCard("TRIMMED", "#34D399", out _vitReclaimedVal, out _vitReclaimedSub, 0, 0));
+            vitalsGrid.Children.Add(CreateVitalCard("COMMIT", "#F8FAFC", out _vitCommitVal, out _vitCommitSub, 0, 1));
+            vitalsGrid.Children.Add(CreateVitalCard("PAGEFILE", "#F8FAFC", out _vitPagefileVal, out _vitPagefileSub, 0, 2));
+            vitalsGrid.Children.Add(CreateVitalCard("KERNEL", "#F8FAFC", out _vitKernelVal, out _vitKernelSub, 1, 0));
+            vitalsGrid.Children.Add(CreateVitalCard("CPU", "#38BDF8", out _vitCpuVal, out _vitCpuSub, 1, 1));
+            vitalsGrid.Children.Add(CreateVitalCard("RULES", "#A855F7", out _vitGovVal, out _vitGovSub, 1, 2));
 
             stack.Children.Add(vitalsGrid);
             card.Child = stack;
@@ -1579,23 +1698,17 @@ namespace PulseRAM
             var titleStack = new StackPanel { Spacing = 1 };
             titleStack.Children.Add(new TextBlock
             {
-                Text = "INTELLIGENT AUTO-PILOT & ACTIVE GUARDS",
+                Text = "AUTO-PILOT",
                 FontSize = 12,
                 FontWeight = FontWeights.Bold,
                 Foreground = BrushHex("#38BDF8")
-            });
-            titleStack.Children.Add(new TextBlock
-            {
-                Text = "Automatically trims background RAM bloat when thresholds are crossed",
-                FontSize = 11,
-                Foreground = BrushHex("#94A3B8")
             });
             hdr.Children.Add(titleStack);
 
             _swAutoPilot = new ToggleSwitch
             {
-                OnContent = "Auto-Pilot Armed",
-                OffContent = "Paused",
+                OnContent = "On",
+                OffContent = "Off",
                 IsOn = _engine.Config.AutoEnabled
             };
             _swAutoPilot.Toggled += (s, e) =>
@@ -1605,6 +1718,7 @@ namespace PulseRAM
                 _engine.SaveConfig();
                 RefreshAllUi();
             };
+            ToolTipService.SetToolTip(_swAutoPilot, "Automatically trims idle apps when RAM crosses the trigger or free RAM drops below the floor.");
             Grid.SetColumn(_swAutoPilot, 1);
             hdr.Children.Add(_swAutoPilot);
             stack.Children.Add(hdr);
@@ -1627,7 +1741,7 @@ namespace PulseRAM
             var s1Top = new Grid();
             s1Top.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             s1Top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            s1Top.Children.Add(new TextBlock { Text = "RAM Trigger Threshold", FontSize = 11.5, FontWeight = FontWeights.SemiBold, Foreground = BrushHex("#F8FAFC") });
+            s1Top.Children.Add(new TextBlock { Text = "Trigger at", FontSize = 11.5, FontWeight = FontWeights.SemiBold, Foreground = BrushHex("#F8FAFC") });
             _lblThresholdVal = new TextBlock { Text = "80%", FontSize = 12.5, FontWeight = FontWeights.Bold, Foreground = BrushHex("#38BDF8") };
             Grid.SetColumn(_lblThresholdVal, 1);
             s1Top.Children.Add(_lblThresholdVal);
@@ -1661,8 +1775,8 @@ namespace PulseRAM
             var s2Top = new Grid();
             s2Top.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             s2Top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            s2Top.Children.Add(new TextBlock { Text = "Min Free RAM Emergency Floor", FontSize = 11.5, FontWeight = FontWeights.SemiBold, Foreground = BrushHex("#F8FAFC") });
-            _lblMinFreeVal = new TextBlock { Text = "2.0 GB", FontSize = 12.5, FontWeight = FontWeights.Bold, Foreground = BrushHex("#38BDF8") };
+            s2Top.Children.Add(new TextBlock { Text = "Min free", FontSize = 11.5, FontWeight = FontWeights.SemiBold, Foreground = BrushHex("#F8FAFC") });
+            _lblMinFreeVal = new TextBlock { Text = "1.0 GB", FontSize = 12.5, FontWeight = FontWeights.Bold, Foreground = BrushHex("#38BDF8") };
             Grid.SetColumn(_lblMinFreeVal, 1);
             s2Top.Children.Add(_lblMinFreeVal);
             s2Stack.Children.Add(s2Top);
@@ -1690,18 +1804,18 @@ namespace PulseRAM
             optsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.8, GridUnitType.Star) });
 
             var presetStack = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
-            presetStack.Children.Add(CreateQuickPresetBtn("70% Gaming", 70, 3.0, "smart"));
-            presetStack.Children.Add(CreateQuickPresetBtn("80% Balanced", 80, 2.0, "smart"));
-            presetStack.Children.Add(CreateQuickPresetBtn("88% Heavy", 88, 1.5, "deep"));
+            presetStack.Children.Add(CreateQuickPresetBtn("Gaming", 70, 3.0, "smart"));
+            presetStack.Children.Add(CreateQuickPresetBtn("Balanced", 80, 2.0, "smart"));
+            presetStack.Children.Add(CreateQuickPresetBtn("Heavy", 88, 1.5, "deep"));
             Grid.SetColumn(presetStack, 0);
             optsGrid.Children.Add(presetStack);
 
             _cmbAutoMode = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch, FontSize = 12 };
-            _cmbAutoMode.Items.Add(new ComboBoxItem { Content = "Auto Mode: Smart Trim", Tag = "smart" });
-            _cmbAutoMode.Items.Add(new ComboBoxItem { Content = "Auto Mode: Deep Sweep", Tag = "deep" });
-            _cmbAutoMode.Items.Add(new ComboBoxItem { Content = "Auto Mode: Standby Purge", Tag = "standby" });
-            _cmbAutoMode.Items.Add(new ComboBoxItem { Content = "Auto Mode: Max Overdrive", Tag = "max" });
-            _cmbAutoMode.SelectedIndex = 0;
+            _cmbAutoMode.Items.Add(new ComboBoxItem { Content = "Smart", Tag = "smart" });
+            _cmbAutoMode.Items.Add(new ComboBoxItem { Content = "Deep", Tag = "deep" });
+            _cmbAutoMode.Items.Add(new ComboBoxItem { Content = "Standby", Tag = "standby" });
+            _cmbAutoMode.Items.Add(new ComboBoxItem { Content = "Max", Tag = "max" });
+            _cmbAutoMode.SelectedIndex = Math.Max(0, Array.IndexOf(new[] { "smart", "deep", "standby", "max" }, _engine.Config.AutoMode));
             _cmbAutoMode.SelectionChanged += (s, e) =>
             {
                 if (_isUpdatingUi) return;
@@ -1715,11 +1829,15 @@ namespace PulseRAM
             optsGrid.Children.Add(_cmbAutoMode);
 
             _cmbCooldown = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch, FontSize = 12 };
-            _cmbCooldown.Items.Add(new ComboBoxItem { Content = "Cooldown: 15s", Tag = 15 });
-            _cmbCooldown.Items.Add(new ComboBoxItem { Content = "Cooldown: 30s", Tag = 30 });
-            _cmbCooldown.Items.Add(new ComboBoxItem { Content = "Cooldown: 60s", Tag = 60 });
-            _cmbCooldown.Items.Add(new ComboBoxItem { Content = "Cooldown: 120s", Tag = 120 });
-            _cmbCooldown.SelectedIndex = 1;
+            int[] cooldownChoices = { 30, 60, 120, 300, 600 };
+            foreach (int cdSec in cooldownChoices)
+            {
+                string cdLabel = cdSec >= 60 ? $"{cdSec / 60} min" : $"{cdSec}s";
+                _cmbCooldown.Items.Add(new ComboBoxItem { Content = $"every {cdLabel}", Tag = cdSec });
+            }
+            int cdIndex = Array.IndexOf(cooldownChoices, _engine.Config.CooldownSeconds);
+            _cmbCooldown.SelectedIndex = cdIndex >= 0 ? cdIndex : 2;
+            ToolTipService.SetToolTip(_cmbCooldown, "Minimum gap between Auto-Pilot sweeps. Doubles automatically (up to 30 min) while sweeps can't relieve memory pressure.");
             _cmbCooldown.SelectionChanged += (s, e) =>
             {
                 if (_isUpdatingUi) return;
@@ -1741,7 +1859,7 @@ namespace PulseRAM
             guardsGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
             // Guard 1: Foreground App Shield + Audio Chime
-            var g1 = CreateGuardTile("Foreground App Shield", "Never trims active window", out _swProtectFg, _engine.Config.ProtectForeground, val =>
+            var g1 = CreateGuardTile("Protect active app", "Never trims the window you are using.", out _swProtectFg, _engine.Config.ProtectForeground, val =>
             {
                 _engine.Config.ProtectForeground = val;
                 _engine.SaveConfig();
@@ -1769,7 +1887,7 @@ namespace PulseRAM
             guardsGrid.Children.Add(g1);
 
             // Guard 2: Runaway Leak Guardian
-            var g2 = CreateGuardTile("Runaway Leak Guardian", "Auto-trims +120 MB/min leaks", out _swLeakGuard, _engine.Config.AutoLeakRemediation, val =>
+            var g2 = CreateGuardTile("Leak guard", "Flags apps whose private memory keeps growing (+120 MB/min) and trims them at most every 5 min.", out _swLeakGuard, _engine.Config.AutoLeakRemediation, val =>
             {
                 _engine.Config.AutoLeakRemediation = val;
                 _engine.SaveConfig();
@@ -1792,8 +1910,8 @@ namespace PulseRAM
             g3Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             g3Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var g3Text = new StackPanel { Spacing = 1, VerticalAlignment = VerticalAlignment.Center };
-            g3Text.Children.Add(new TextBlock { Text = "Scheduled Sweep", FontSize = 11.5, FontWeight = FontWeights.Bold, Foreground = BrushHex("#F8FAFC") });
-            _lblSchedCountdown = new TextBlock { Text = "Periodic timer off", FontSize = 10.5, Foreground = BrushHex("#94A3B8") };
+            g3Text.Children.Add(new TextBlock { Text = "Every", FontSize = 11.5, FontWeight = FontWeights.Bold, Foreground = BrushHex("#F8FAFC") });
+            _lblSchedCountdown = new TextBlock { Text = "off", FontSize = 10.5, Foreground = BrushHex("#94A3B8") };
             g3Text.Children.Add(_lblSchedCountdown);
             Grid.SetColumn(g3Text, 0);
             g3Grid.Children.Add(g3Text);
@@ -1803,7 +1921,8 @@ namespace PulseRAM
             _cmbSchedInterval.Items.Add(new ComboBoxItem { Content = "15m", Tag = 15 });
             _cmbSchedInterval.Items.Add(new ComboBoxItem { Content = "30m", Tag = 30 });
             _cmbSchedInterval.Items.Add(new ComboBoxItem { Content = "60m", Tag = 60 });
-            _cmbSchedInterval.SelectedIndex = 1;
+            int schedIndex = Array.IndexOf(new[] { 10, 15, 30, 60 }, _engine.Config.ScheduledIntervalMinutes);
+            _cmbSchedInterval.SelectedIndex = schedIndex >= 0 ? schedIndex : 1;
             _cmbSchedInterval.SelectionChanged += (s, e) =>
             {
                 if (_isUpdatingUi) return;
@@ -1841,11 +1960,20 @@ namespace PulseRAM
             guardsGrid.Children.Add(g3);
 
             // Guard 4: Windows Startup Registry
-            var g4 = CreateGuardTile("Windows Startup", "Auto-start in System Tray", out _swStartup, _engine.Config.RunOnStartup, val =>
+            var g4 = CreateGuardTile("Start with Windows", _engine.IsAdmin ? "Starts elevated in the tray at logon." : "Starts in the tray at logon (standard user — run as Admin and re-enable to start elevated).", out _swStartup, _engine.Config.RunOnStartup, val =>
             {
-                _engine.SetWindowsStartupRegistry(val);
-                ShowToast(val ? "Windows Startup Enabled" : "Windows Startup Disabled",
-                    val ? "Registered PulseRAM (--tray) in HKCU\\...\\Run" : "Removed from Windows Startup registry");
+                // schtasks can take a few seconds; keep the UI responsive.
+                _swStartup.IsEnabled = false;
+                RunEngineActionAsync(() => _engine.SetStartup(val), res =>
+                {
+                    ShowToast(res.Ok ? (val ? "Windows Startup Enabled" : "Windows Startup Disabled") : "Startup Not Changed", res.Message);
+                    if (!res.Ok)
+                    {
+                        _isUpdatingUi = true;
+                        _swStartup.IsOn = _engine.Config.RunOnStartup;
+                        _isUpdatingUi = false;
+                    }
+                }, "startup", always: () => _swStartup.IsEnabled = true);
             });
             Grid.SetRow(g4, 1);
             Grid.SetColumn(g4, 1);
@@ -1876,7 +2004,7 @@ namespace PulseRAM
                 _engine.Config.AutoMode = mode;
                 _engine.SaveConfig();
                 RefreshAllUi();
-                ShowToast($"Applied {label} Preset", $"Auto-Pilot set to {pct}% RAM ceiling ({minFree:F1} GB floor)");
+                ShowToast($"{label} preset", $"Trigger {pct}% · floor {minFree:F1} GB · {mode}");
             };
             return btn;
         }
@@ -1898,7 +2026,7 @@ namespace PulseRAM
 
             var sp = new StackPanel { Spacing = 1, VerticalAlignment = VerticalAlignment.Center };
             sp.Children.Add(new TextBlock { Text = title, FontSize = 11.5, FontWeight = FontWeights.Bold, Foreground = BrushHex("#F8FAFC") });
-            sp.Children.Add(new TextBlock { Text = sub, FontSize = 10.5, Foreground = BrushHex("#94A3B8") });
+            if (!string.IsNullOrEmpty(sub)) ToolTipService.SetToolTip(b, sub);
             Grid.SetColumn(sp, 0);
             g.Children.Add(sp);
 
@@ -1936,22 +2064,16 @@ namespace PulseRAM
             var titleStack = new StackPanel { Spacing = 1 };
             titleStack.Children.Add(new TextBlock
             {
-                Text = "TOP MEMORY CONSUMERS (QUICK GOVERNOR)",
+                Text = "TOP APPS",
                 FontSize = 12,
                 FontWeight = FontWeights.Bold,
                 Foreground = BrushHex("#38BDF8")
-            });
-            titleStack.Children.Add(new TextBlock
-            {
-                Text = "Instant per-app Working Set Trim, EcoQoS, Cryo-Freeze, Cap, & Shield",
-                FontSize = 11,
-                Foreground = BrushHex("#94A3B8")
             });
             hdr.Children.Add(titleStack);
 
             var openAllBtn = new Button
             {
-                Content = "Open Full Inspector →",
+                Content = "All →",
                 FontSize = 11,
                 FontWeight = FontWeights.SemiBold,
                 Padding = new Thickness(10, 5, 10, 5),
@@ -1985,7 +2107,7 @@ namespace PulseRAM
             hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             hdr.Children.Add(new TextBlock
             {
-                Text = "OPTIMIZATION ACTIVITY LOG",
+                Text = "ACTIVITY",
                 FontSize = 12,
                 FontWeight = FontWeights.Bold,
                 Foreground = BrushHex("#38BDF8")
@@ -2020,7 +2142,7 @@ namespace PulseRAM
 
             _searchBox = new TextBox
             {
-                PlaceholderText = "Search process or PID...",
+                PlaceholderText = "Search",
                 FontSize = 12
             };
             _searchBox.TextChanged += (s, e) =>
@@ -2032,10 +2154,10 @@ namespace PulseRAM
             toolbar.Children.Add(_searchBox);
 
             _cmbSortProcs = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch, FontSize = 12 };
-            _cmbSortProcs.Items.Add(new ComboBoxItem { Content = "Sort: Memory (MB)", Tag = "memory" });
-            _cmbSortProcs.Items.Add(new ComboBoxItem { Content = "Sort: Smart Score", Tag = "score" });
-            _cmbSortProcs.Items.Add(new ComboBoxItem { Content = "Sort: CPU %", Tag = "cpu" });
-            _cmbSortProcs.Items.Add(new ComboBoxItem { Content = "Sort: Leak (+MB/m)", Tag = "leak" });
+            _cmbSortProcs.Items.Add(new ComboBoxItem { Content = "Memory", Tag = "memory" });
+            _cmbSortProcs.Items.Add(new ComboBoxItem { Content = "Score", Tag = "score" });
+            _cmbSortProcs.Items.Add(new ComboBoxItem { Content = "CPU", Tag = "cpu" });
+            _cmbSortProcs.Items.Add(new ComboBoxItem { Content = "Growth", Tag = "leak" });
             _cmbSortProcs.SelectedIndex = 0;
             _cmbSortProcs.SelectionChanged += (s, e) =>
             {
@@ -2052,7 +2174,7 @@ namespace PulseRAM
             var grpStack = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
             _btnGroupApps = new Button
             {
-                Content = "Grouped Apps",
+                Content = "Apps",
                 FontSize = 11.5,
                 FontWeight = FontWeights.SemiBold,
                 CornerRadius = new CornerRadius(8),
@@ -2062,7 +2184,7 @@ namespace PulseRAM
             };
             _btnGroupPids = new Button
             {
-                Content = "Individual PIDs",
+                Content = "Processes",
                 FontSize = 11.5,
                 FontWeight = FontWeights.SemiBold,
                 CornerRadius = new CornerRadius(8),
@@ -2079,10 +2201,10 @@ namespace PulseRAM
 
             // Filter Buttons + Thaw All
             var filterStack = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, HorizontalAlignment = HorizontalAlignment.Right };
-            AddFilterButton(filterStack, "all", "All Apps");
-            AddFilterButton(filterStack, "idle", "Idle Bloat & Leaks");
-            AddFilterButton(filterStack, "governed", "Frozen / EcoQoS");
-            AddFilterButton(filterStack, "protected", "Shielded / Capped");
+            AddFilterButton(filterStack, "all", "All");
+            AddFilterButton(filterStack, "idle", "Idle & leaks");
+            AddFilterButton(filterStack, "governed", "Frozen & eco");
+            AddFilterButton(filterStack, "protected", "Shielded & capped");
 
             var thawBtn = new Button
             {
@@ -2156,24 +2278,18 @@ namespace PulseRAM
             var tStack = new StackPanel { Spacing = 2 };
             tStack.Children.Add(new TextBlock
             {
-                Text = "PER-GAME & WORKLOAD AUTO-PROFILES",
+                Text = "PROFILES",
                 FontSize = 13,
                 FontWeight = FontWeights.Bold,
                 Foreground = BrushHex("#38BDF8")
-            });
-            tStack.Children.Add(new TextBlock
-            {
-                Text = "Automatically switches RAM thresholds, shields active game/render EXEs, and triggers launch sweeps",
-                FontSize = 11.5,
-                Foreground = BrushHex("#94A3B8")
             });
             hdr.Children.Add(tStack);
 
             var rightHdr = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
             _swProfileAuto = new ToggleSwitch
             {
-                OnContent = "Auto-Detect Running EXEs",
-                OffContent = "Manual Profile Only",
+                OnContent = "Auto-detect",
+                OffContent = "Manual",
                 IsOn = _engine.Config.ProfilesAutoSwitch
             };
             _swProfileAuto.Toggled += (s, e) =>
@@ -2186,7 +2302,7 @@ namespace PulseRAM
 
             var autoBtn = new Button
             {
-                Content = "Return to Auto-Detect",
+                Content = "Use auto-detect",
                 FontSize = 11.5,
                 CornerRadius = new CornerRadius(8)
             };
@@ -2217,7 +2333,7 @@ namespace PulseRAM
             var hkStack = new StackPanel { Spacing = 10 };
             hkStack.Children.Add(new TextBlock
             {
-                Text = "WIN32 SYSTEM-WIDE GLOBAL HOTKEYS",
+                Text = "HOTKEYS",
                 FontSize = 13,
                 FontWeight = FontWeights.Bold,
                 Foreground = BrushHex("#38BDF8")
@@ -2230,9 +2346,9 @@ namespace PulseRAM
 
             var hkBox1 = CreateCardBorder(new Thickness(12));
             var hk1Sp = new StackPanel { Spacing = 4 };
-            hk1Sp.Children.Add(new TextBlock { Text = "Global Hotkey Listener", FontWeight = FontWeights.Bold, FontSize = 12.5 });
-            hk1Sp.Children.Add(new TextBlock { Text = "Win32 RegisterHotKey active in background", FontSize = 11, Foreground = BrushHex("#94A3B8") });
-            _swHotkeys = new ToggleSwitch { OnContent = "Hotkeys Enabled", OffContent = "Disabled", IsOn = _engine.Config.HotkeysEnabled };
+            hk1Sp.Children.Add(new TextBlock { Text = "Hotkeys", FontWeight = FontWeights.Bold, FontSize = 12.5 });
+            _swHotkeys = new ToggleSwitch { OnContent = "On", OffContent = "Off", IsOn = _engine.Config.HotkeysEnabled };
+            ToolTipService.SetToolTip(_swHotkeys, $"Edit keys in {System.IO.Path.Combine(NativeMemoryEngine.DataDirectory, "pulseram_config.json")}");
             _swHotkeys.Toggled += (s, e) =>
             {
                 if (_isUpdatingUi) return;
@@ -2247,18 +2363,18 @@ namespace PulseRAM
 
             var hkBox2 = CreateCardBorder(new Thickness(12));
             var hk2Sp = new StackPanel { Spacing = 4 };
-            hk2Sp.Children.Add(new TextBlock { Text = "Primary Quick-Clean Hotkey", FontWeight = FontWeights.Bold, FontSize = 12.5 });
-            hk2Sp.Children.Add(new TextBlock { Text = "Ctrl + Shift + M", FontSize = 16, FontWeight = FontWeights.ExtraBold, Foreground = BrushHex("#38BDF8") });
-            hk2Sp.Children.Add(new TextBlock { Text = "Executes instant Smart Trim anywhere in Windows", FontSize = 11, Foreground = BrushHex("#94A3B8") });
+            hk2Sp.Children.Add(new TextBlock { Text = "Smart", FontWeight = FontWeights.Bold, FontSize = 12.5 });
+            string hkPrimaryText = TryParseHotkey(_engine.Config.HotkeyPrimary, out _, out _, out string hkPrimaryLabel) ? hkPrimaryLabel : $"Invalid: {_engine.Config.HotkeyPrimary}";
+            hk2Sp.Children.Add(new TextBlock { Text = hkPrimaryText, FontSize = 16, FontWeight = FontWeights.ExtraBold, Foreground = BrushHex("#38BDF8") });
             hkBox2.Child = hk2Sp;
             Grid.SetColumn(hkBox2, 1);
             hkRow.Children.Add(hkBox2);
 
             var hkBox3 = CreateCardBorder(new Thickness(12));
             var hk3Sp = new StackPanel { Spacing = 4 };
-            hk3Sp.Children.Add(new TextBlock { Text = "Secondary Deep-Purge Hotkey", FontWeight = FontWeights.Bold, FontSize = 12.5 });
-            hk3Sp.Children.Add(new TextBlock { Text = "Ctrl + Shift + P", FontSize = 16, FontWeight = FontWeights.ExtraBold, Foreground = BrushHex("#A855F7") });
-            hk3Sp.Children.Add(new TextBlock { Text = "Executes Deep Working Set + Standby Cache Purge", FontSize = 11, Foreground = BrushHex("#94A3B8") });
+            hk3Sp.Children.Add(new TextBlock { Text = "Deep", FontWeight = FontWeights.Bold, FontSize = 12.5 });
+            string hkSecondaryText = TryParseHotkey(_engine.Config.HotkeySecondary, out _, out _, out string hkSecondaryLabel) ? hkSecondaryLabel : $"Invalid: {_engine.Config.HotkeySecondary}";
+            hk3Sp.Children.Add(new TextBlock { Text = hkSecondaryText, FontSize = 16, FontWeight = FontWeights.ExtraBold, Foreground = BrushHex("#A855F7") });
             hkBox3.Child = hk3Sp;
             Grid.SetColumn(hkBox3, 2);
             hkRow.Children.Add(hkBox3);
@@ -2267,9 +2383,67 @@ namespace PulseRAM
             hkCard.Child = hkStack;
             stack.Children.Add(hkCard);
 
+            stack.Children.Add(BuildDeviceCard());
+
             scroll.Content = stack;
             outer.Children.Add(scroll);
             return outer;
+        }
+
+        /// <summary>Shows what PC PulseRAM tuned itself for, the UI weight, and a one-click re-tune.</summary>
+        private Border BuildDeviceCard()
+        {
+            var card = CreateCardBorder();
+            var row = new Grid { ColumnSpacing = 12 };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var info = new StackPanel { Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
+            info.Children.Add(new TextBlock { Text = "DEVICE", FontSize = 13, FontWeight = FontWeights.Bold, Foreground = BrushHex("#38BDF8") });
+            info.Children.Add(new TextBlock { Text = _engine.Device.Label, FontSize = 12, Foreground = BrushHex("#F8FAFC") });
+            row.Children.Add(info);
+
+            var cmbUi = new ComboBox { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, MinWidth = 120 };
+            cmbUi.Items.Add(new ComboBoxItem { Content = "UI: Auto", Tag = "auto" });
+            cmbUi.Items.Add(new ComboBoxItem { Content = "UI: Lite", Tag = "lite" });
+            cmbUi.Items.Add(new ComboBoxItem { Content = "UI: Full", Tag = "full" });
+            cmbUi.SelectedIndex = Math.Max(0, Array.IndexOf(new[] { "auto", "lite", "full" }, _engine.Config.UiMode));
+            ToolTipService.SetToolTip(cmbUi, "Lite: no ambient animation, slower refresh and fewer rows — easier on low-end PCs. Auto picks Lite on low-end hardware.");
+            cmbUi.SelectionChanged += (s, e) =>
+            {
+                if (cmbUi.SelectedItem is ComboBoxItem item && item.Tag is string mode)
+                {
+                    _engine.Config.UiMode = mode;
+                    _engine.SaveConfig();
+                    ApplyPerformanceMode();
+                    RefreshAllUi(force: true);
+                }
+            };
+            Grid.SetColumn(cmbUi, 1);
+            row.Children.Add(cmbUi);
+
+            var retune = new Button
+            {
+                Content = "Re-tune",
+                FontSize = 12,
+                CornerRadius = new CornerRadius(8),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            ToolTipService.SetToolTip(retune, "Reset the trigger, free-memory floor, cooldown and profile triggers to the recommended values for this PC.");
+            retune.Click += (s, e) =>
+            {
+                _engine.RetuneForThisDevice();
+                RefreshAllUi(force: true);
+                RenderProfilesGrid();
+                ShowToast("Tuned for this PC",
+                    $"Trigger {_engine.Config.RamThresholdPercent}% · floor {_engine.Config.MinFreeRamGb:F2} GB · cooldown {_engine.Config.CooldownSeconds / 60.0:0.#} min");
+            };
+            Grid.SetColumn(retune, 2);
+            row.Children.Add(retune);
+
+            card.Child = row;
+            return card;
         }
 
         private Border BuildToastBanner()
@@ -2368,11 +2542,11 @@ namespace PulseRAM
 
             string title = modeKey switch
             {
-                "smart" => "⚡ Smart Trim RAM Now",
-                "deep" => "⚡ Run Deep Sweep Now",
-                "standby" => "⚡ Purge Standby Cache Now",
-                "max" => "⚡ Run Max Overdrive Now",
-                _ => "⚡ Optimize RAM Now"
+                "smart" => "⚡ Clean · Smart",
+                "deep" => "⚡ Clean · Deep",
+                "standby" => "⚡ Clean · Standby",
+                "max" => "⚡ Clean · Max",
+                _ => "⚡ Clean"
             };
             _optimizeBtnLabel.Text = title;
         }
@@ -2394,7 +2568,8 @@ namespace PulseRAM
 
             _rightColumnOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
             _bottomSplitOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
-            _miniHudBtn.Content = _isMiniHud ? "Exit Mini HUD" : "Mini HUD";
+            _miniHudBtn.Content = new FontIcon { Glyph = _isMiniHud ? "\uE73F" : "\uE944", FontSize = 13 };
+            ToolTipService.SetToolTip(_miniHudBtn, _isMiniHud ? "Back to full view" : "Compact, always-on-top view");
             _miniHudBtn.BorderBrush = _isMiniHud ? BrushHex("#10B981") : BrushHex("#94A3B8", 45);
 
             try
@@ -2425,9 +2600,35 @@ namespace PulseRAM
 
         private void ThawAllFrozenApps()
         {
-            int count = _engine.ThawAllApps();
-            RefreshAllUi();
-            ShowToast("Thawed All Processes", $"Resumed {count} suspended application(s).");
+            RunEngineActionAsync(() => _engine.ThawAllApps(), count =>
+                ShowToast("Thawed All Processes", $"Resumed {count} suspended application(s)."), "thaw-all");
+        }
+
+        private readonly HashSet<string> _pendingActions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Runs an engine call (process enumeration, OpenProcess…) off the UI thread, then refreshes.
+        /// Repeat clicks for the same <paramref name="key"/> are ignored until the first one finishes,
+        /// and exceptions are reported instead of crashing the process (ThreadPool exceptions are fatal).
+        /// </summary>
+        private void RunEngineActionAsync<T>(Func<T> work, Action<T> onDone, string? key = null, Action? always = null)
+        {
+            if (key != null && !_pendingActions.Add(key)) return;
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                T result = default!;
+                Exception? error = null;
+                try { result = work(); }
+                catch (Exception ex) { error = ex; }
+                DispatcherQueue.TryEnqueue(() =>
+                {
+                    if (key != null) _pendingActions.Remove(key);
+                    always?.Invoke();
+                    RefreshAllUi();
+                    if (error != null) ShowToast("Action failed", error.Message);
+                    else onDone(result);
+                });
+            });
         }
 
         private void RequestAdminElevation()
@@ -2444,6 +2645,9 @@ namespace PulseRAM
                 var psi = new ProcessStartInfo
                 {
                     FileName = exePath,
+                    // Tells the new instance to wait for this one to exit instead of bowing out
+                    // because the single-instance mutex is still held.
+                    Arguments = "--elevated-relaunch",
                     UseShellExecute = true,
                     Verb = "runas"
                 };
@@ -2459,38 +2663,58 @@ namespace PulseRAM
         private void RunOptimizationAsync(string mode, string reason)
         {
             _optimizeNowBtn.IsEnabled = false;
-            _optimizeBtnLabel.Text = "Optimizing Kernel Memory...";
+            _optimizeBtnLabel.Text = "Cleaning…";
             TriggerReactorShockwaveAnimation();
 
-            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            RunEngineActionAsync(() => _engine.OptimizeMemory(mode, "Manual", reason), ev =>
             {
-                var ev = _engine.OptimizeMemory(mode, "Manual", reason);
-                DispatcherQueue.TryEnqueue(() =>
-                {
-                    _optimizeNowBtn.IsEnabled = true;
-                    SelectCleaningMode(_selectedMode);
-                    TriggerReactorShockwaveAnimation();
-                    RefreshAllUi();
-                    ShowToast(
-                        $"Reclaimed {FormatMb(ev.FreedMb)} in {ev.DurationMs} ms!",
-                        $"RAM dropped {ev.BeforePercent:F1}% → {ev.AfterPercent:F1}% ({ev.ProcessesTrimmed} processes trimmed)");
-                });
+                TriggerReactorShockwaveAnimation();
+                var (title, sub) = DescribeEvent(ev);
+                ShowToast(ev.Skipped ? title : $"{title} in {ev.DurationMs} ms", sub);
+            }, "sweep", always: () =>
+            {
+                _optimizeNowBtn.IsEnabled = true;
+                SelectCleaningMode(_selectedMode);
             });
         }
 
         private void OnEngineOptimizationCompleted(OptimizationEvent ev)
         {
-            if (ev.Trigger != "Manual")
+            // Manual sweeps toast from RunOptimizationAsync; per-app buttons toast themselves.
+            if (ev.Trigger != "Manual" && ev.Trigger != "Targeted")
             {
                 DispatcherQueue.TryEnqueue(() =>
                 {
                     TriggerReactorShockwaveAnimation();
                     RefreshAllUi();
-                    ShowToast(
-                        $"{ev.Trigger}: Freed {FormatMb(ev.FreedMb)}",
-                        $"{ev.Reason} ({ev.BeforePercent:F1}% → {ev.AfterPercent:F1}%)");
+                    var (title, sub) = DescribeEvent(ev);
+                    ShowToast($"{ev.Trigger}: {title}", $"{ev.Reason} · {sub}");
                 });
             }
+            else if (ev.Trigger == "Targeted")
+            {
+                DispatcherQueue.TryEnqueue(() => RefreshAllUi());
+            }
+        }
+
+        /// <summary>Describes an optimization using only measured values.</summary>
+        private static (string Title, string Sub) DescribeEvent(OptimizationEvent ev)
+        {
+            if (ev.Skipped)
+                return ($"{ev.Mode}: nothing changed", string.IsNullOrEmpty(ev.Note) ? ev.Reason : ev.Note);
+
+            string title = ev.Mode == "STANDBY"
+                ? (ev.StandbyPurged
+                    ? $"Standby cache purged · free memory +{FormatMb(ev.FreeListGainMb)}"
+                    : "Standby purge failed")
+                : $"Trimmed {FormatMb(ev.FreedMb)} from {ev.ProcessesTrimmed} process(es)";
+
+            var parts = new List<string>();
+            if (ev.Mode != "STANDBY") parts.Add($"Available +{FormatMb(ev.AvailableGainMb)}");
+            parts.Add($"RAM {ev.BeforePercent:F1}% → {ev.AfterPercent:F1}%");
+            if (ev.StandbyPurged && ev.Mode != "STANDBY") parts.Add("standby purged");
+            if (!string.IsNullOrEmpty(ev.Note)) parts.Add(ev.Note);
+            return (title, string.Join(" · ", parts));
         }
 
         private void ShowToast(string title, string sub)
@@ -2539,9 +2763,66 @@ namespace PulseRAM
             return mb >= 1024.0 ? $"{(mb / 1024.0):F2} GB" : $"{Math.Round(mb)} MB";
         }
 
-        private void RefreshAllUi()
+        private bool IsDashboardVisible() => IsWindowVisible(_hwnd) && !IsIconic(_hwnd);
+
+        private static bool WindowsAnimationsEnabled()
+        {
+            try { return new Windows.UI.ViewManagement.UISettings().AnimationsEnabled; }
+            catch { return true; }
+        }
+
+        /// <summary>
+        /// Lite mode (auto on low-end PCs): slower refresh, no ambient animation, fewer process rows.
+        /// Reduce-motion also follows the Windows "Animation effects" accessibility setting.
+        /// </summary>
+        private void ApplyPerformanceMode()
+        {
+            bool lite = _engine.LiteMode;
+            _reduceMotion = lite || !WindowsAnimationsEnabled();
+            _uiTimer.Interval = TimeSpan.FromMilliseconds(lite ? 3000 : 1500);
+            if (!_reduceMotion && _oldWndProc != IntPtr.Zero) StartAmbientXamlAnimations(); // switched to Full at runtime
+            _animationsPaused = !_animationsPaused; // force SetAnimationsPaused to re-evaluate
+            SetAnimationsPaused(_reduceMotion || !IsDashboardVisible());
+            if (_reduceMotion) StepGauge(1.0);
+        }
+
+        /// <summary>Pauses the 60 FPS gauge timer and looping storyboards while the window is hidden or minimised.</summary>
+        private void SetAnimationsPaused(bool paused)
+        {
+            if (paused == _animationsPaused) return;
+            _animationsPaused = paused;
+            try
+            {
+                if (_gaugeAnimTimer != null)
+                {
+                    if (paused) _gaugeAnimTimer.Stop();
+                    else _gaugeAnimTimer.Start();
+                }
+                foreach (var sb in new[] { _reactorBreathingStoryboard, _reactorOrbitalStoryboard, _logoPulseStoryboard })
+                {
+                    if (sb == null) continue;
+                    if (paused) sb.Pause();
+                    else sb.Resume();
+                }
+            }
+            catch { }
+        }
+
+        private void RefreshAllUi(bool force = false)
         {
             if (_isUpdatingUi) return;
+
+            // While PulseRAM sits in the tray, only the tooltip needs updating: rebuilding ~130 process rows
+            // and animating the gauge every 1.5 s for an invisible window just burns CPU and battery.
+            if (!force && !IsDashboardVisible())
+            {
+                var hiddenSnap = _engine.GetSnapshot();
+                UpdateTrayTooltip(hiddenSnap.Percent, hiddenSnap.AvailableGb);
+                SetAnimationsPaused(true);
+                return;
+            }
+            SetAnimationsPaused(_reduceMotion);
+
             _isUpdatingUi = true;
             try
             {
@@ -2557,18 +2838,22 @@ namespace PulseRAM
                 _tabProcCountText.Text = procs.Count.ToString();
                 _sessionFreedTopText.Text = FormatMb(snap.SessionFreedMb);
 
-                _focusBoostBtn.Content = _engine.Config.FocusBoostActive ? "⚡ Focus Boost: ON (62%)" : "⚡ Focus Boost: OFF";
+                _focusBoostBtn.Content = _engine.Config.FocusBoostActive ? "⚡ Focus On" : "⚡ Focus";
                 _focusBoostBtn.BorderBrush = _engine.Config.FocusBoostActive ? BrushHex("#A855F7") : BrushHex("#94A3B8", 45);
                 _focusBoostBtn.Background = _engine.Config.FocusBoostActive ? BrushHex("#A855F7", 45) : BrushHex("#151F35", 190);
 
                 _apStatusDot.Fill = _engine.Config.AutoEnabled ? BrushHex("#10B981") : BrushHex("#64748B");
-                _apStatusPillText.Text = _engine.Config.AutoEnabled
-                    ? $"Auto-Pilot: {snap.EffectiveThresholdPercent}% · {snap.ActiveProfileName}"
-                    : "Auto-Pilot: Paused";
+                _apStatusPillText.Text = _engine.Config.AutoEnabled ? $"Auto {snap.EffectiveThresholdPercent}%" : "Auto off";
+                string apTip = _engine.Config.AutoEnabled
+                    ? $"Auto-Pilot sweeps at {snap.EffectiveThresholdPercent}% RAM · profile: {snap.ActiveProfileName} · cooldown {snap.EffectiveCooldownSeconds / 60.0:0.#} min"
+                    : "Auto-Pilot is paused";
+                if (!Equals(_apStatusTip.Content, apTip)) _apStatusTip.Content = apTip;
 
                 if (snap.IsAdmin)
                 {
-                    _adminBtn.Content = "✓ Kernel Admin Active";
+                    _adminBtn.Content = "✓ Admin";
+                    const string adminTip = "Running as administrator: kernel purges available.";
+                    if (!Equals(_adminTip.Content, adminTip)) _adminTip.Content = adminTip;
                     _adminBtn.Background = BrushHex("#10B981", 35);
                     _adminBtn.BorderBrush = BrushHex("#10B981", 110);
                     _adminBtn.Foreground = BrushHex("#34D399");
@@ -2587,13 +2872,15 @@ namespace PulseRAM
                 _gaugeUsedPath.Stroke = BrushHex(stateHex);
                 _reactorPulseHalo.Stroke = BrushHex(stateHex, 115);
 
-                double cacheRatio = Math.Clamp(snap.StandbyAndCacheGb / Math.Max(0.1, snap.TotalGb), 0.0, 0.35);
                 double usedRatio = Math.Clamp(snap.Percent / 100.0, 0.01, 0.999);
+                // Standby is part of "Available", so used + standby + free ≈ total.
+                double cacheRatio = Math.Clamp(snap.StandbyAndCacheGb / Math.Max(0.1, snap.TotalGb), 0.0, Math.Max(0.0, 0.98 - usedRatio));
                 double combinedRatio = Math.Clamp(usedRatio + cacheRatio, 0.01, 0.999);
 
                 _targetUsedRatio = usedRatio;
                 _targetCombinedRatio = combinedRatio;
                 _targetThresholdPct = snap.EffectiveThresholdPercent;
+                if (_reduceMotion) StepGauge(1.0);
 
                 // Physical Memory Map
                 _availSummaryText.Text = $"{snap.AvailableGb:F2} GB Available";
@@ -2602,48 +2889,57 @@ namespace PulseRAM
                 _colSegCache.Width = new GridLength(Math.Max(2, cacheRatio * 100), GridUnitType.Star);
                 _colSegFree.Width = new GridLength(Math.Max(2, freeRatio * 100), GridUnitType.Star);
                 _legUsedText.Text = $"{snap.UsedGb:F2} GB";
-                _legCacheText.Text = $"{snap.StandbyAndCacheGb:F2} GB";
+                _legCacheText.Text = snap.MemoryListsMeasured ? $"{snap.StandbyAndCacheGb:F2} GB" : $"~{snap.StandbyAndCacheGb:F2} GB (est.)";
                 _legAvailText.Text = $"{snap.AvailableGb:F2} GB";
 
-                double estReclaimMb = procs.Sum(p => p.ReclaimableMb);
-                _optimizeBtnSub.Text = $"Est. Reclaimable: ~{FormatMb(estReclaimMb)}";
+                if (_selectedMode == "standby")
+                {
+                    _optimizeBtnSub.Text = snap.StandbyPurgeSupported
+                        ? $"{snap.StandbyAndCacheGb:F2} GB standby"
+                        : "needs Admin";
+                }
+                else
+                {
+                    double trimmableMb = procs.Sum(p => p.ReclaimableMb);
+                    _optimizeBtnSub.Text = $"up to {FormatMb(trimmableMb)} trimmable";
+                }
 
                 // 6 Kernel Vitals
                 _vitReclaimedVal.Text = FormatMb(snap.SessionFreedMb);
-                _vitReclaimedSub.Text = $"{snap.OptimizationCount} sweeps completed";
+                _vitReclaimedSub.Text = $"{snap.OptimizationCount} sweeps";
 
                 _vitCommitVal.Text = $"{snap.CommitTotalGb:F1} / {snap.CommitLimitGb:F1} GB";
-                _vitCommitSub.Text = $"{snap.CommitPercent:F1}% virtual commit load";
+                _vitCommitSub.Text = $"{snap.CommitPercent:F0}% used";
 
                 _vitPagefileVal.Text = snap.PagefileTotalGb > 0.05 ? $"{snap.PagefileUsedGb:F2} GB" : "0.00 GB";
                 _vitPagefileSub.Text = snap.PagefileTotalGb > 0.05
-                    ? $"{snap.PagefilePercent:F1}% of {snap.PagefileTotalGb:F1} GB swap"
-                    : "Swap file idle";
+                    ? $"{snap.PagefilePercent:F0}% of {snap.PagefileTotalGb:F1} GB"
+                    : "idle";
 
                 _vitKernelVal.Text = $"{snap.KernelTotalMb:F0} MB";
-                _vitKernelSub.Text = $"Paged {snap.KernelPagedMb:F0}M · Non-Paged {snap.KernelNonPagedMb:F0}M";
+                _vitKernelSub.Text = $"paged {snap.KernelPagedMb:F0} · non-paged {snap.KernelNonPagedMb:F0} MB";
 
                 _vitCpuVal.Text = $"{snap.CpuPercent:F1}%";
                 string fgShort = string.IsNullOrEmpty(snap.ForegroundApp) ? "Desktop" : snap.ForegroundApp;
-                _vitCpuSub.Text = $"{snap.ProcessCount} Procs · FG: {fgShort}";
+                _vitCpuSub.Text = $"{snap.ProcessCount} processes";
 
                 int frozenCnt = procs.Count(p => p.IsFrozen);
                 int ecoCnt = procs.Count(p => p.IsEco);
                 int capCnt = _engine.Config.AppMemoryCapsMb?.Count ?? 0;
                 int protCnt = _engine.Config.ProtectedApps?.Count ?? 0;
-                _vitGovVal.Text = $"{protCnt} Shield · {capCnt} Cap";
-                _vitGovSub.Text = $"{frozenCnt} Frozen · {ecoCnt} EcoQoS";
+                _vitGovVal.Text = $"{protCnt} shield · {capCnt} cap";
+                _vitGovSub.Text = $"{frozenCnt} frozen · {ecoCnt} eco";
 
                 // Scheduled Countdown
                 if (_engine.Config.ScheduledTrimEnabled && snap.NextScheduledSeconds > 0)
                 {
                     int mm = snap.NextScheduledSeconds / 60;
                     int ss = snap.NextScheduledSeconds % 60;
-                    _lblSchedCountdown.Text = $"Next sweep in {mm:D2}:{ss:D2}";
+                    _lblSchedCountdown.Text = $"next in {mm:D2}:{ss:D2}";
                 }
                 else
                 {
-                    _lblSchedCountdown.Text = "Periodic timer off";
+                    _lblSchedCountdown.Text = "off";
                 }
 
                 // Sync Sliders
@@ -2657,7 +2953,8 @@ namespace PulseRAM
                 if (events.Count > 0)
                 {
                     var latest = events[0];
-                    _lastSweepSummaryText.Text = $"Last Sweep [{latest.Timestamp}]: Reclaimed {FormatMb(latest.FreedMb)} ({latest.BeforePercent:F1}% → {latest.AfterPercent:F1}%)";
+                    var (latestTitle, _) = DescribeEvent(latest);
+                    _lastSweepSummaryText.Text = $"{latest.Timestamp} · {latestTitle}";
                 }
                 RenderEventLog(events);
                 RenderProcessLists(procs);
@@ -2769,7 +3066,7 @@ namespace PulseRAM
         {
             // 1. Dashboard Top 8 Consumers
             _dashTopProcsPanel.Children.Clear();
-            foreach (var item in rawItems.OrderByDescending(p => p.MemoryMb).Take(8))
+            foreach (var item in rawItems.OrderByDescending(p => p.MemoryMb).Take(_engine.LiteMode ? 5 : 8))
             {
                 _dashTopProcsPanel.Children.Add(CreateProcessRowElement(item));
             }
@@ -2802,7 +3099,7 @@ namespace PulseRAM
             };
 
             _fullProcsPanel.Children.Clear();
-            foreach (var item in filtered.Take(50))
+            foreach (var item in filtered.Take(_engine.LiteMode ? 25 : 50))
             {
                 _fullProcsPanel.Children.Add(CreateProcessRowElement(item));
             }
@@ -2916,22 +3213,23 @@ namespace PulseRAM
 
             var btnTrim = CreateMiniActionButton("Trim", false, "#38BDF8", () =>
             {
-                var ev = _engine.OptimizeSingleApp(p.Name, "Manual App Trim");
+                string appName = p.Name;
                 TriggerReactorShockwaveAnimation();
-                RefreshAllUi();
-                ShowToast($"Trimmed {p.Name}", $"Reclaimed {FormatMb(ev.FreedMb)} across {ev.ProcessesTrimmed} process(es).");
+                RunEngineActionAsync(() => _engine.OptimizeSingleApp(appName, "Manual App Trim"), ev =>
+                    ShowToast(ev.Skipped ? $"Could not trim {appName}" : $"Trimmed {appName}",
+                        ev.Skipped ? ev.Note : $"{FormatMb(ev.FreedMb)} paged out of {ev.ProcessesTrimmed} process(es)."), "trim:" + appName);
             });
             var btnEco = CreateMiniActionButton("Eco", p.IsEco, "#2DD4BF", () =>
             {
-                var res = _engine.ToggleEcoApp(p.Name);
-                RefreshAllUi();
-                ShowToast(res.EcoActive ? $"EcoQoS Active: {p.Name}" : $"EcoQoS Off: {p.Name}", res.Message);
+                string appName = p.Name;
+                RunEngineActionAsync(() => _engine.ToggleEcoApp(appName), res =>
+                    ShowToast(res.Ok ? (res.EcoActive ? $"EcoQoS Active: {appName}" : $"EcoQoS Off: {appName}") : "Not Changed", res.Message), "eco:" + appName);
             });
             var btnFreeze = CreateMiniActionButton(p.IsFrozen ? "Thaw" : "Freeze", p.IsFrozen, "#60A5FA", () =>
             {
-                var res = _engine.ToggleFreezeApp(p.Name);
-                RefreshAllUi();
-                ShowToast(res.Ok ? (res.Frozen ? $"Frozen {p.Name}" : $"Thawed {p.Name}") : "Protected Process", res.Message);
+                string appName = p.Name;
+                RunEngineActionAsync(() => _engine.ToggleFreezeApp(appName), res =>
+                    ShowToast(res.Ok ? (res.Frozen ? $"Frozen {appName}" : $"Thawed {appName}") : (res.Frozen ? "Still frozen" : "Not frozen"), res.Message), "freeze:" + appName);
             });
             var btnCap = CreateMiniActionButton(p.CapMb.HasValue ? $"{p.CapMb.Value}M" : "Cap", p.CapMb.HasValue, "#38BDF8", () =>
             {
@@ -2939,10 +3237,10 @@ namespace PulseRAM
             });
             var btnShield = CreateMiniActionButton(p.IsProtected ? "Shielded" : "Shield", p.IsProtected, "#10B981", () =>
             {
-                bool nowProt = _engine.ToggleProtectApp(p.Name);
-                RefreshAllUi();
-                ShowToast(nowProt ? $"Shielded {p.Name}" : $"Unshielded {p.Name}",
-                    nowProt ? "Added to Auto-Pilot Shield whitelist." : "Removed from whitelist.");
+                string appName = p.Name;
+                RunEngineActionAsync(() => _engine.ToggleProtectApp(appName), nowProt =>
+                    ShowToast(nowProt ? $"Shielded {appName}" : $"Unshielded {appName}",
+                        nowProt ? "Never trimmed by any sweep." : "Removed from the shield list."), "shield:" + appName);
             });
 
             actions.Children.Add(btnTrim);
@@ -2992,7 +3290,7 @@ namespace PulseRAM
             var sp = new StackPanel { Spacing = 10 };
             sp.Children.Add(new TextBlock
             {
-                Text = $"Current Working Set: {FormatMb(proc.MemoryMb)}. When {proc.Name} is in the background and exceeds its memory ceiling, PulseRAM automatically trims it.",
+                Text = $"Now {FormatMb(proc.MemoryMb)}. Hard limit per process — set it too low and the app slows down.",
                 FontSize = 12,
                 Foreground = BrushHex("#94A3B8"),
                 TextWrapping = TextWrapping.Wrap
@@ -3000,7 +3298,7 @@ namespace PulseRAM
 
             var inputBox = new TextBox
             {
-                Header = "Memory Ceiling (MB)",
+                Header = "Limit per process (MB)",
                 Text = (proc.CapMb ?? Math.Max(256, (int)(proc.MemoryMb * 0.75))).ToString()
             };
 
@@ -3027,16 +3325,17 @@ namespace PulseRAM
             {
                 if (int.TryParse(inputBox.Text.Trim(), out int capMb) && capMb >= 64)
                 {
-                    _engine.SetAppMemoryCap(proc.Name, capMb);
+                    await System.Threading.Tasks.Task.Run(() => _engine.SetAppMemoryCap(proc.Name, capMb));
                     RefreshAllUi();
-                    ShowToast($"Capped {proc.Name} at {capMb} MB", "Auto-Pilot will enforce this working-set ceiling.");
+                    ShowToast($"Capped {proc.Name} at {capMb} MB",
+                        "Hard working-set limit applied. Windows pages the app out above this, so a cap that is too low makes it slow.");
                 }
             }
             else if (result == ContentDialogResult.Secondary)
             {
-                _engine.SetAppMemoryCap(proc.Name, null);
+                await System.Threading.Tasks.Task.Run(() => _engine.SetAppMemoryCap(proc.Name, null));
                 RefreshAllUi();
-                ShowToast($"Removed Cap on {proc.Name}", "Working-set ceiling cleared.");
+                ShowToast($"Removed Cap on {proc.Name}", "Hard working-set limit released.");
             }
         }
 
@@ -3049,7 +3348,7 @@ namespace PulseRAM
             {
                 _eventLogPanel.Children.Add(new TextBlock
                 {
-                    Text = "No sweeps yet in this session. Click Optimize RAM Now or let Auto-Pilot govern memory automatically.",
+                    Text = "No sweeps yet.",
                     FontSize = 11.5,
                     Foreground = BrushHex("#64748B"),
                     Margin = new Thickness(4, 12, 4, 12),
@@ -3074,7 +3373,9 @@ namespace PulseRAM
                 top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 top.Children.Add(new TextBlock
                 {
-                    Text = $"+{FormatMb(ev.FreedMb)} Reclaimed ({ev.Mode})",
+                    Text = ev.Skipped
+                        ? $"Skipped ({ev.Mode})"
+                        : (ev.Mode == "STANDBY" ? $"+{FormatMb(ev.FreeListGainMb)} freed ({ev.Mode})" : $"{FormatMb(ev.FreedMb)} trimmed ({ev.Mode})"),
                     FontSize = 12,
                     FontWeight = FontWeights.Bold,
                     Foreground = BrushHex("#34D399")
@@ -3087,7 +3388,10 @@ namespace PulseRAM
                 sp.Children.Add(new TextBlock { Text = ev.Reason, FontSize = 11.5, FontWeight = FontWeights.SemiBold, Foreground = BrushHex("#F8FAFC") });
                 sp.Children.Add(new TextBlock
                 {
-                    Text = $"RAM {ev.BeforePercent:F1}% → {ev.AfterPercent:F1}% · {ev.ProcessesTrimmed} processes trimmed",
+                    Text = string.IsNullOrEmpty(ev.Note)
+                        ? $"RAM {ev.BeforePercent:F1}% → {ev.AfterPercent:F1}% · {ev.ProcessesTrimmed} processes trimmed"
+                        : $"RAM {ev.BeforePercent:F1}% → {ev.AfterPercent:F1}% · {ev.ProcessesTrimmed} processes trimmed · {ev.Note}",
+                    TextWrapping = TextWrapping.Wrap,
                     FontSize = 10.5,
                     Foreground = BrushHex("#94A3B8")
                 });
@@ -3115,11 +3419,11 @@ namespace PulseRAM
                 };
 
                 var sp = new StackPanel { Spacing = 8 };
+                ToolTipService.SetToolTip(card, prof.Description);
                 sp.Children.Add(new TextBlock { Text = prof.Name, FontSize = 14, FontWeight = FontWeights.Bold, Foreground = BrushHex("#F8FAFC") });
-                sp.Children.Add(new TextBlock { Text = prof.Description, FontSize = 11.5, Foreground = BrushHex("#94A3B8"), TextWrapping = TextWrapping.Wrap });
                 sp.Children.Add(new TextBlock
                 {
-                    Text = $"Trigger: {prof.RamThresholdPercent}% RAM · Mode: {prof.AutoMode.ToUpperInvariant()} · Auto-Shield: {(prof.AutoShieldMatched ? "ON" : "OFF")}",
+                    Text = $"{prof.RamThresholdPercent}% · {prof.AutoMode}{(prof.AutoShieldMatched ? " · shields app" : "")}",
                     FontSize = 11,
                     FontWeight = FontWeights.SemiBold,
                     Foreground = BrushHex("#38BDF8")
@@ -3127,7 +3431,7 @@ namespace PulseRAM
 
                 var actBtn = new Button
                 {
-                    Content = isForced ? "✓ Active Profile (Click to Release)" : "Force Activate Profile",
+                    Content = isForced ? "✓ Active" : "Activate",
                     FontSize = 11.5,
                     FontWeight = FontWeights.SemiBold,
                     CornerRadius = new CornerRadius(8),

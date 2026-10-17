@@ -1,0 +1,133 @@
+name: Build installer
+
+on:
+  push:
+    branches: [main, "fix/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          [xml]$proj = Get-Content PulseRAM.csproj
+          $v = ($proj.Project.PropertyGroup | Where-Object { $_.Version } | Select-Object -First 1).Version
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "PulseRAM version $v"
+
+      - name: Publish self-contained (with WinUI resources)
+        shell: pwsh
+        run: |
+          # The csproj turns PRI generation off for quick local builds; the release build needs
+          # resources.pri and the Microsoft.UI.Xaml theme files, so turn it back on here. The PRI tasks ship
+          # with Visual Studio (not the dotnet CLI), so publish with Visual Studio's MSBuild.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -prerelease -products * -requires Microsoft.Component.MSBuild -property installationPath
+          Write-Host "Visual Studio: $vs"
+          $msbuild = Join-Path $vs "MSBuild\Current\Bin\amd64\MSBuild.exe"
+          & $msbuild -version
+          Get-ChildItem (Join-Path $vs "MSBuild\Microsoft\VisualStudio") -Recurse -Filter Microsoft.Build.Packaging.Pri.Tasks.dll -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "PRI tasks: $($_.FullName)" }
+          $out = Join-Path $PWD "publish_selfcontained\"
+          & $msbuild PulseRAM.csproj -restore -t:Publish -v:normal -nologo "-flp:logfile=msbuild.log;verbosity=detailed" `
+            -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:SelfContained=true `
+            "-p:PublishDir=$out" `
+            -p:EnableCoreMrtTooling=true -p:AppxGeneratePriEnabled=true -p:IncludeProjectPriFile=true
+          $code = $LASTEXITCODE
+          Write-Host "== PRI-related MSBuild targets =="
+          Select-String -Path msbuild.log -Pattern 'Target "(_GenerateProjectPri|_ExpandPri|_CreateProjectPriFileItem|_GenerateProjectPriFileCore|_ExpandProjectPriFile)[^"]*"|MakePri|Skipping target "_GenerateProjectPri' |
+            Select-Object -First 60 | ForEach-Object { Write-Host $_.Line.Trim() }
+          if ($code -ne 0) { exit $code }
+
+      - name: Verify WinUI resources are present
+        shell: pwsh
+        run: |
+          $dir = "publish_selfcontained"
+          Write-Host "== PRI / XBF anywhere in bin, obj, publish =="
+          Get-ChildItem bin, obj, $dir -Recurse -Include *.pri, *.xbf, priconfig.xml, *.resfiles -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("{0,10}  {1}" -f $_.Length, $_.FullName) }
+          Get-ChildItem $dir -Filter *.pri | Select-Object Name, Length | Format-Table -AutoSize
+          if (Test-Path "$dir\Microsoft.UI.Xaml") { Get-ChildItem "$dir\Microsoft.UI.Xaml" -Recurse | Select-Object FullName | Format-Table -AutoSize }
+          $missing = @()
+          if (-not (Test-Path "$dir\Microsoft.UI.Xaml\Themes")) { Write-Host "Note: no loose Microsoft.UI.Xaml\Themes files (themes are read from the PRI files); the smoke test decides." }
+          foreach ($f in @("PulseRAM.exe", "PulseRAM.dll", "resources.pri", "Microsoft.UI.Xaml.Controls.pri", "pulseram_defaults.json")) {
+            if (-not (Test-Path (Join-Path $dir $f))) { $missing += $f }
+          }
+          if ($missing.Count -gt 0) { Write-Error "Missing from publish output: $($missing -join ', ')"; exit 1 }
+
+      - name: Smoke test (launch, stay alive, write config)
+        shell: pwsh
+        run: |
+          $cfg = Join-Path $env:LOCALAPPDATA "PulseRAM\pulseram_config.json"
+          if (Test-Path $cfg) { Remove-Item $cfg -Force }
+          $p = Start-Process -FilePath "publish_selfcontained\PulseRAM.exe" -PassThru
+          Start-Sleep -Seconds 25
+          $p.Refresh()
+          if ($p.HasExited) {
+            Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-2) } -ErrorAction SilentlyContinue |
+              Where-Object { $_.ProviderName -in @('Application Error', '.NET Runtime', 'Windows Error Reporting') } |
+              Select-Object -First 5 | Format-List TimeCreated, ProviderName, Message
+            Write-Error "PulseRAM exited during startup (exit code $($p.ExitCode))."
+            exit 1
+          }
+          if (-not (Test-Path $cfg)) { Write-Error "PulseRAM did not write $cfg"; exit 1 }
+          Write-Host "PulseRAM is running; config written:"
+          Get-Content $cfg -TotalCount 12
+          # Exercise the installer's thaw entry point too.
+          $t = Start-Process -FilePath "publish_selfcontained\PulseRAM.exe" -ArgumentList "--thaw-frozen" -PassThru -Wait
+          Write-Host "--thaw-frozen exit code: $($t.ExitCode)"
+          Stop-Process -Id $p.Id -Force
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { Write-Error "ISCC.exe not found"; exit 1 }
+          & $iscc PulseRAM.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = "dist\PulseRAM-Setup-v${{ steps.ver.outputs.version }}.exe"
+          if (-not (Test-Path $exe)) { Write-Error "Installer not produced"; exit 1 }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          "$hash  PulseRAM-Setup-v${{ steps.ver.outputs.version }}.exe" | Out-File -Encoding ascii "dist\SHA256SUMS.txt"
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Test installer (silent install, launch, uninstall)
+        shell: pwsh
+        run: |
+          $exe = "dist\PulseRAM-Setup-v${{ steps.ver.outputs.version }}.exe"
+          $inst = Start-Process -FilePath $exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER" -PassThru -Wait
+          if ($inst.ExitCode -ne 0) { Write-Error "Installer exit code $($inst.ExitCode)"; exit 1 }
+          $app = Join-Path $env:LOCALAPPDATA "Programs\PulseRAM\PulseRAM.exe"
+          if (-not (Test-Path $app)) { Write-Error "Installed EXE not found at $app"; exit 1 }
+          $p = Start-Process -FilePath $app -PassThru
+          Start-Sleep -Seconds 20
+          $p.Refresh()
+          if ($p.HasExited) { Write-Error "Installed PulseRAM exited during startup"; exit 1 }
+          Write-Host "Installed build runs."
+          $unins = Join-Path $env:LOCALAPPDATA "Programs\PulseRAM\unins000.exe"
+          $u = Start-Process -FilePath $unins -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru -Wait
+          Write-Host "Uninstaller exit code: $($u.ExitCode)"
+          Start-Sleep -Seconds 3
+          if (Get-Process -Name PulseRAM -ErrorAction SilentlyContinue) { Write-Error "PulseRAM still running after uninstall"; exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PulseRAM-Setup-v${{ steps.ver.outputs.version }}
+          path: |
+            dist/PulseRAM-Setup-v${{ steps.ver.outputs.version }}.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
