@@ -1,6 +1,6 @@
 # PulseRAM ⚡
 
-> **Native WinUI 3 + NT Kernel Intelligent Memory Optimizer & Process Governor for Windows 10 & 11**
+> **Intelligent Memory Optimizer & Process Governor for Windows 10 & 11**
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6?logo=windows)
 ![Framework](https://img.shields.io/badge/Framework-WinUI%203%20%7C%20WindowsAppSDK%201.6-4B0082?logo=dotnet)
