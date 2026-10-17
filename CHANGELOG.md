@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.3.0 — 2026-10-18
+
+### New
+- **Memory-limit warning.** What actually crashes apps ("out of memory") is the commit limit — RAM plus page file — not RAM %. When committed memory passes 90% (critical at 96%), PulseRAM shows a banner, or a Windows notification while it's in the tray, with advice for your setup: no page file, a page file capped too low, or which app is using the most. One click opens the page-file settings. Toggle: *Memory warnings*.
+- **Light theme.** PulseRAM follows the Windows light/dark setting and switches live; pick Dark or Light under *Profiles → Device* to override.
+- **Remembers its window.** Size, position and maximized state are restored on the next launch (re-centred if that monitor is no longer connected), and the window has a sensible minimum size.
+- **Crash log.** Errors used to be silently swallowed. They are now written to `%LocalAppData%\PulseRAM\logs` along with a startup line and every sweep; PulseRAM tells you when something went wrong or the last session ended unexpectedly. *Logs* button on the Device card.
+
+### Improved
+- Clicking a PulseRAM notification opens the dashboard.
+- The first window size fits small laptop screens instead of assuming 1440×930.
+
 ## v1.2.0 — 2026-10-18
 
 Ideas borrowed (as designs, not code) from MIT-licensed [System Informer](https://github.com/winsiderss/systeminformer), [H.NotifyIcon](https://github.com/HavenDV/H.NotifyIcon) and [tray-monitor](https://github.com/strayge/tray-monitor).

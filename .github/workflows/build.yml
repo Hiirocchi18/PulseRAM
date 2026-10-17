@@ -84,6 +84,12 @@ jobs:
             exit 1
           }
           if (-not (Test-Path $cfg)) { Write-Error "PulseRAM did not write $cfg"; exit 1 }
+          $logDir = Join-Path $env:LOCALAPPDATA "PulseRAM\logs"
+          $log = Get-ChildItem $logDir -Filter "pulseram-*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $log) { Write-Error "PulseRAM did not write a log in $logDir"; exit 1 }
+          Write-Host "Log ($($log.Name)):"
+          Get-Content $log.FullName -TotalCount 20
+          if (Select-String -Path $log.FullName -Pattern " ERROR " -Quiet) { Write-Error "Errors were logged during startup"; exit 1 }
           Write-Host "PulseRAM is running; config written:"
           Get-Content $cfg -TotalCount 12
           # Exercise the installer's thaw entry point too.

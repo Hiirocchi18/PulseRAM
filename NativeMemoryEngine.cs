@@ -33,6 +33,8 @@ namespace PulseRAM
         public double RepurposeMbPerMin { get; set; } = -1;
         /// <summary>True when purging the standby cache would actually help (free memory is low / cache is being evicted).</summary>
         public bool StandbyPurgeWorthwhile { get; set; }
+        /// <summary>"ok", "high" (≥ 90% of the commit limit) or "critical" (≥ 96%), with hysteresis.</summary>
+        public string CommitLevel { get; set; } = "ok";
         public double Percent { get; set; }
         public string PressureLevel { get; set; } = "OPTIMAL";
         public double CommitTotalGb { get; set; }
@@ -195,6 +197,16 @@ namespace PulseRAM
         public bool TrayShowsPercent { get; set; } = true;
         /// <summary>Run PulseRAM itself in Windows Efficiency Mode (EcoQoS) while it is hidden in the tray.</summary>
         public bool EfficiencyModeWhenHidden { get; set; } = true;
+        /// <summary>"system" (follow Windows), "dark" or "light".</summary>
+        public string Theme { get; set; } = "system";
+        /// <summary>Warn when committed memory nears the commit limit (RAM + page file) — the real cause of "out of memory".</summary>
+        public bool CommitWarningEnabled { get; set; } = true;
+        /// <summary>Last window placement in physical pixels (null = centre on the primary screen).</summary>
+        public int? WindowX { get; set; }
+        public int? WindowY { get; set; }
+        public int? WindowWidth { get; set; }
+        public int? WindowHeight { get; set; }
+        public bool WindowMaximized { get; set; }
         /// <summary>Tier the defaults were tuned for on first run ("low", "mid", "high"; empty = not tuned).</summary>
         public string TunedForTier { get; set; } = "";
     }
@@ -202,6 +214,16 @@ namespace PulseRAM
     public enum DeviceTier { Low, Mid, High }
 
     /// <summary>What kind of PC we are on, used to pick sensible defaults and the UI weight.</summary>
+    /// <summary>What to tell the user when committed memory nears the commit limit.</summary>
+    public sealed class CommitAdvice
+    {
+        public string Level { get; init; } = "high";
+        public string Title { get; init; } = "";
+        public string Body { get; init; } = "";
+        /// <summary>True when changing the page file is part of the fix (offer to open its settings).</summary>
+        public bool SuggestPageFile { get; init; }
+    }
+
     public sealed class DeviceInfo
     {
         public double RamGb { get; init; }
@@ -717,6 +739,12 @@ namespace PulseRAM
 
         public event Action<OptimizationEvent>? OnOptimizationCompleted;
 
+        /// <summary>Raised (background thread) when commit charge climbs into "high" or "critical".</summary>
+        public event Action<CommitAdvice>? OnCommitWarning;
+
+        private string _commitLevel = "ok";
+        private DateTime _lastCommitWarning = DateTime.MinValue;
+
         public NativeMemoryEngine()
         {
             Directory.CreateDirectory(DataDirectory);
@@ -743,6 +771,8 @@ namespace PulseRAM
 
             Device = DetectDevice();
             LoadConfig();
+            Log.Info($"PulseRAM {typeof(NativeMemoryEngine).Assembly.GetName().Version} on {Environment.OSVersion.VersionString} · " +
+                     $"{Device.Label} · admin={_isAdmin} · purgeRights={_privilegesEnabled} · ui={Config.UiMode}");
 
             _memCounters = new MemoryListCounters();
 
@@ -1051,9 +1081,9 @@ namespace PulseRAM
                 File.WriteAllText(tmp, json);
                 File.Move(tmp, _configPath, overwrite: true);
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore disk write failure
+                Log.Warn($"Could not save settings to {_configPath}", ex);
             }
         }
 
@@ -1125,6 +1155,7 @@ namespace PulseRAM
             {
                 if (_disposed) return;
                 var snap = SampleTelemetryAndProcesses(forceProcessScan: false, recordTelemetry: true);
+                CheckCommitPressure(snap);
 
                 // 1. Scheduled maintenance sweep
                 if (Config.ScheduledTrimEnabled && Config.ScheduledIntervalMinutes > 0)
@@ -1178,9 +1209,10 @@ namespace PulseRAM
                 // 3. Per-app memory caps & runaway leak guard
                 EnforceAppCapsAndLeakGuard(snap.ForegroundApp);
             }
-            catch
+            catch (Exception ex)
             {
-                // Never crash background loop
+                // Never crash the background loop, but record why it hiccupped.
+                Log.Error("Background tick failed", ex);
             }
             finally
             {
@@ -1247,6 +1279,115 @@ namespace PulseRAM
                     }
                 }
             }
+        }
+
+        #endregion
+
+        #region Commit charge (RAM + page file) warning
+
+        private string _lastWarnedLevel = "ok";
+        private int _lastWarningRank = 0;
+
+        /// <summary>
+        /// Trimming can't help here: committed memory counts against RAM + page file whether or not it is in RAM.
+        /// When it nears the limit, new allocations fail ("out of memory", apps crash). Warns when the level rises;
+        /// the same level is not repeated within 30 minutes (so hovering around a threshold can't spam), but a
+        /// jump to "critical" always warns.
+        /// </summary>
+        private void CheckCommitPressure(MemorySnapshot snap)
+        {
+            string level = snap.CommitLevel;
+            if (!Config.CommitWarningEnabled || level == "ok")
+            {
+                _lastWarnedLevel = level;
+                return;
+            }
+
+            int rank = level == "critical" ? 2 : 1;
+            int lastRank = _lastWarnedLevel == "critical" ? 2 : (_lastWarnedLevel == "high" ? 1 : 0);
+            if (rank <= lastRank)
+            {
+                _lastWarnedLevel = level; // steady or easing off: nothing new to say
+                return;
+            }
+
+            _lastWarnedLevel = level;
+            bool repeatTooSoon = rank <= _lastWarningRank && (DateTime.Now - _lastCommitWarning).TotalMinutes < 30;
+            if (repeatTooSoon) return;
+
+            _lastWarningRank = rank;
+            _lastCommitWarning = DateTime.Now;
+            var advice = BuildCommitAdvice(snap);
+            Log.Warn($"Commit charge {snap.CommitPercent:F0}% ({snap.CommitTotalGb:F1}/{snap.CommitLimitGb:F1} GB): {advice.Title}");
+            try { OnCommitWarning?.Invoke(advice); } catch (Exception ex) { Log.Error("Commit warning handler failed", ex); }
+        }
+
+        private enum PageFileKind { None, SystemManaged, Custom, Unknown }
+
+        /// <summary>Reads the page-file configuration (readable without admin rights).</summary>
+        private static (PageFileKind Kind, int MaxMb) ReadPageFileSetup()
+        {
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management", false);
+                if (key?.GetValue("PagingFiles") is not string[] entries) return (PageFileKind.Unknown, 0);
+                var used = entries.Where(e => !string.IsNullOrWhiteSpace(e)).ToList();
+                if (used.Count == 0) return (PageFileKind.None, 0);
+
+                int maxTotal = 0;
+                foreach (var e in used)
+                {
+                    // "?:\pagefile.sys" = automatic for all drives; "C:\pagefile.sys 0 0" or a bare path = system managed;
+                    // "C:\pagefile.sys 4096 8192" = custom initial/maximum in MB.
+                    var parts = e.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (parts[0].StartsWith("?:", StringComparison.Ordinal)) return (PageFileKind.SystemManaged, 0);
+                    if (parts.Length < 3 || !int.TryParse(parts[2], out int max) || max == 0) return (PageFileKind.SystemManaged, 0);
+                    maxTotal += max;
+                }
+                return (PageFileKind.Custom, maxTotal);
+            }
+            catch
+            {
+                return (PageFileKind.Unknown, 0);
+            }
+        }
+
+        private CommitAdvice BuildCommitAdvice(MemorySnapshot snap)
+        {
+            string top = "";
+            lock (_lock)
+            {
+                var biggest = _cachedGroupedProcesses
+                    .Where(p => !IsCritical(p.Name))
+                    .OrderByDescending(p => p.PrivateMb)
+                    .FirstOrDefault();
+                if (biggest != null && biggest.PrivateMb >= 300)
+                    top = $" {biggest.Name} is using the most ({biggest.PrivateMb / 1024.0:F1} GB committed).";
+            }
+
+            var (kind, maxMb) = ReadPageFileSetup();
+            string level = snap.CommitLevel;
+            string usage = $"{snap.CommitTotalGb:F1} of {snap.CommitLimitGb:F1} GB committed ({snap.CommitPercent:F0}%).";
+            string title = level == "critical" ? "Almost out of memory" : "Running low on memory";
+
+            return kind switch
+            {
+                PageFileKind.None => new CommitAdvice
+                {
+                    Level = level, Title = title, SuggestPageFile = true,
+                    Body = $"{usage} There is no page file, so apps will crash when this hits 100%. Turn on \"System managed size\" in page-file settings.{top}"
+                },
+                PageFileKind.Custom => new CommitAdvice
+                {
+                    Level = level, Title = title, SuggestPageFile = true,
+                    Body = $"{usage} Your page file is capped at {maxMb / 1024.0:F1} GB. Raise the maximum or choose \"System managed size\".{top}"
+                },
+                _ => new CommitAdvice
+                {
+                    Level = level, Title = title, SuggestPageFile = kind == PageFileKind.Unknown,
+                    Body = $"{usage} Freeing RAM won't help — close or restart apps you don't need.{top}"
+                }
+            };
         }
 
         #endregion
@@ -1399,6 +1540,14 @@ namespace PulseRAM
             double commitTotalGb = (perfInfo.CommitTotal.ToUInt64() * pageSize) / GB;
             double commitLimitGb = Math.Max(0.1, (perfInfo.CommitLimit.ToUInt64() * pageSize) / GB);
             double commitPct = (commitTotalGb / commitLimitGb) * 100.0;
+            // Hysteresis so the warning doesn't flicker around a threshold.
+            string commitLevel = _commitLevel switch
+            {
+                "critical" => commitPct >= 93 ? "critical" : (commitPct >= 85 ? "high" : "ok"),
+                "high" => commitPct >= 96 ? "critical" : (commitPct >= 85 ? "high" : "ok"),
+                _ => commitPct >= 96 ? "critical" : (commitPct >= 90 ? "high" : "ok")
+            };
+            _commitLevel = commitLevel;
 
             double pfTotalGb = Math.Max(0.0, (memStatus.ullTotalPageFile / GB) - totalGb);
             double pfAvailGb = Math.Max(0.0, (memStatus.ullAvailPageFile / GB) - availGb);
@@ -1465,6 +1614,7 @@ namespace PulseRAM
                 StandbyByPriorityGb = standbyByPriority,
                 RepurposeMbPerMin = Math.Round(_repurposeMbPerMin, 0),
                 StandbyPurgeWorthwhile = purgeWorthwhile,
+                CommitLevel = commitLevel,
                 Percent = Math.Round(percent, 1),
                 PressureLevel = pressure,
                 CommitTotalGb = Math.Round(commitTotalGb, 2),
@@ -2058,6 +2208,9 @@ namespace PulseRAM
                 while (_events.Count > 40)
                     _events.RemoveAt(_events.Count - 1);
             }
+            Log.Info($"{ev.Mode} [{ev.Trigger}] {ev.Reason} → trimmed {ev.FreedMb:F0} MB from {ev.ProcessesTrimmed}, " +
+                     $"avail +{ev.AvailableGainMb:F0} MB, free +{ev.FreeListGainMb:F0} MB, standby={ev.StandbyPurged}, {ev.DurationMs} ms" +
+                     (string.IsNullOrEmpty(ev.Note) ? "" : $" · {ev.Note}"));
 
             if (countAsOptimization && Config.AutoSoundChime && trigger != "Manual")
             {

@@ -95,7 +95,15 @@ Shielded apps, critical system processes and (by default) the foreground app are
 * **Live tray icon**: shows the current RAM % (green → amber → red with memory pressure), drawn crisply for any display scaling. Live tooltip and a quick-action menu; launching PulseRAM again brings the existing window forward.
 * **Light in the tray**: while hidden, PulseRAM stops drawing its UI and runs itself in Windows **Efficiency Mode** (EcoQoS, below-normal priority).
 
-### 6. Windows Startup
+### 6. Memory-limit warning
+* RAM % isn't what makes apps crash — the **commit limit** (RAM + page file) is. When committed memory passes 90% (critical at 96%), PulseRAM shows a banner (or a Windows notification while it's in the tray) with advice that fits your PC: no page file, a page file capped too low, or which app is using the most. One click opens the page-file settings. Trimming can't fix this, and PulseRAM says so. Toggle: *Profiles → Device → Memory warnings*.
+
+### 7. Feels native
+* **Light and dark theme** — follows Windows by default and switches live; or pick Dark/Light under *Profiles → Device*.
+* **Remembers its window** — size, position and maximized state are restored (safely re-centred if that monitor is gone), with a sensible minimum size.
+* **Crash log** — errors are written to `%LocalAppData%\PulseRAM\logs` (kept 7 days) instead of being silently ignored, and PulseRAM tells you if the last session ended unexpectedly. *Profiles → Device → Logs* opens the folder.
+
+### 8. Windows Startup
 * Toggle **Windows Startup** on the dashboard. When PulseRAM is running **as administrator**, startup is registered as an elevated Task Scheduler task (`PulseRAM Elevated Startup`) so Standby/Deep/Max kernel purges keep working after a reboot. Otherwise it uses the per-user `HKCU\...\Run` key and starts as a standard user.
 
 ---
@@ -106,6 +114,7 @@ Shielded apps, critical system processes and (by default) the foreground app are
 |---|---|---|
 | `pulseram_config.json` | `%LocalAppData%\PulseRAM\` | Your settings (always writable, even for an all-users install). |
 | `frozen_processes.json` | `%LocalAppData%\PulseRAM\` | Journal of PIDs PulseRAM has frozen; used to resume them after a crash. |
+| `logs\pulseram-*.log` | `%LocalAppData%\PulseRAM\` | Startup info, every sweep, warnings and errors (7 days, 2 MB per file). Attach these to bug reports. |
 | `pulseram_defaults.json` | Install folder | Defaults applied on first run. Settings saved by v1.0 next to the EXE are imported once. |
 
 Command-line switches: `--tray` (start hidden in the tray), `--thaw-frozen` (resume anything PulseRAM left suspended, then exit; used by the installer).
@@ -149,7 +158,7 @@ dotnet build -c Release -r win-x64
 .\Build-Installer.ps1
 ```
 
-The compiled single-file installer will be located in `dist\PulseRAM-Setup-v1.2.0.exe`.
+The compiled single-file installer will be located in `dist\PulseRAM-Setup-v1.3.0.exe`.
 
 Every push is also built on GitHub Actions (`.github/workflows/build.yml`): publish, resource check, a launch smoke test, the Inno Setup installer, and a silent install → launch → uninstall test. The installer is attached to the run as an artifact.
 
