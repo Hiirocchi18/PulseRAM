@@ -4,9 +4,9 @@
 ; -----------------------------------------------------------------------------
 
 #define MyAppName "PulseRAM"
-#define MyAppVersion "1.0.0"
-#define MyAppPublisher "JoyBoy"
-#define MyAppURL "https://github.com/JoyBoy/PulseRAM"
+#define MyAppVersion "1.1.0"
+#define MyAppPublisher "Hiirocchi18"
+#define MyAppURL "https://github.com/Hiirocchi18/PulseRAM"
 #define MyAppExeName "PulseRAM.exe"
 
 [Setup]
@@ -22,7 +22,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 OutputDir=dist
-OutputBaseFilename=PulseRAM-Setup-v1.0.0
+OutputBaseFilename=PulseRAM-Setup-v{#MyAppVersion}
 SetupIconFile=PulseRAM.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -45,8 +45,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "runonstartup"; Description: "Launch PulseRAM minimized in System Tray when Windows starts"; GroupDescription: "Windows Integration:"
 
 [Files]
-Source: "publish_selfcontained\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pdb,startup.log,pulseram_config.json"
-Source: "publish_selfcontained\pulseram_config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
+; User settings are stored in %LocalAppData%\PulseRAM, so never ship a pulseram_config.json from a dev run.
+Source: "publish_selfcontained\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pdb,startup.log,pulseram_config.json,pulseram_defaults.json"
+; Defaults are always refreshed on upgrade; a v1.0 pulseram_config.json already in {app} is imported once by the app.
+Source: "pulseram_defaults.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "PulseRAM.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -60,22 +62,62 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
+[UninstallRun]
+; Remove the optional elevated logon task created by "Windows Startup" when PulseRAM ran as administrator.
+; Fails harmlessly if it does not exist or the uninstaller is not elevated.
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""PulseRAM Elevated Startup"" /F"; Flags: runhidden; RunOnceId: "DeleteElevatedStartupTask"
+
+[UninstallDelete]
+Type: files; Name: "{localappdata}\PulseRAM\frozen_processes.json"
+
 [Code]
-// Gracefully kill running PulseRAM instance before installing or uninstalling
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+// PulseRAM 1.1+ understands --thaw-frozen. Older builds would open their full UI instead
+// (and block this installer), so check the file version first.
+function InstalledExeSupportsThaw(const ExePath: String): Boolean;
+var
+  VersionMS, VersionLS: Cardinal;
+begin
+  Result := FileExists(ExePath) and GetVersionNumbers(ExePath, VersionMS, VersionLS)
+    and (VersionMS >= $00010001);
+end;
+
+function RegisterWindowMessage(lpString: String): Cardinal;
+  external 'RegisterWindowMessageW@user32.dll stdcall';
+
+// Resume any apps PulseRAM has Cryo-Frozen, then stop it. Force-killing first would leave those
+// apps suspended with nothing able to resume them.
+procedure ThawFrozenAppsAndStopPulseRAM();
 var
   ResultCode: Integer;
+  ExePath: String;
+  ExitMsg: Cardinal;
 begin
+  ExePath := ExpandConstant('{app}\{#MyAppExeName}');
+  if InstalledExeSupportsThaw(ExePath) then
+  begin
+    // 1) Ask a running PulseRAM (even an elevated one, which taskkill from this non-elevated
+    //    installer cannot stop) to thaw everything and exit cleanly.
+    ExitMsg := RegisterWindowMessage('PulseRAM.ExitForInstaller.v1');
+    if ExitMsg <> 0 then
+    begin
+      PostBroadcastMessage(ExitMsg, 0, 0);
+      Sleep(2500);
+    end;
+    // 2) Resume anything still journaled from a crashed session.
+    Exec(ExePath, '--thaw-frozen', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+  // 3) Last resort for older versions / hung instances.
   Exec('taskkill.exe', '/f /im PulseRAM.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  ThawFrozenAppsAndStopPulseRAM();
   Result := '';
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-var
-  ResultCode: Integer;
 begin
   if CurUninstallStep = usUninstall then
-  begin
-    Exec('taskkill.exe', '/f /im PulseRAM.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  end;
+    ThawFrozenAppsAndStopPulseRAM();
 end;

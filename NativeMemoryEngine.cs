@@ -1,14 +1,13 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Media;
 using System.Runtime.InteropServices;
+using System.Security;
 using System.Security.Principal;
+using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading;
 using Microsoft.Win32;
 
@@ -19,8 +18,12 @@ namespace PulseRAM
         public double TotalGb { get; set; }
         public double UsedGb { get; set; }
         public double AvailableGb { get; set; }
+        /// <summary>Standby list size (Core + Normal + Reserve priority). Measured via PDH when available.</summary>
         public double StandbyAndCacheGb { get; set; }
+        /// <summary>Free + Zero page lists. Measured via PDH when available.</summary>
         public double FreeExactGb { get; set; }
+        /// <summary>True when Standby/Free values come from the real memory-list counters, false when they are estimates.</summary>
+        public bool MemoryListsMeasured { get; set; }
         public double Percent { get; set; }
         public string PressureLevel { get; set; } = "OPTIMAL";
         public double CommitTotalGb { get; set; }
@@ -46,6 +49,8 @@ namespace PulseRAM
         public int EffectiveThresholdPercent { get; set; } = 80;
         public string EffectiveMode { get; set; } = "smart";
         public int NextScheduledSeconds { get; set; }
+        /// <summary>Current Auto-Pilot cooldown including any adaptive back-off.</summary>
+        public int EffectiveCooldownSeconds { get; set; }
     }
 
     public class ProcessItem
@@ -53,9 +58,13 @@ namespace PulseRAM
         public string Name { get; set; } = "";
         public int Pid { get; set; }
         public int ProcessCount { get; set; } = 1;
+        /// <summary>Working set (physical RAM currently mapped) in MB.</summary>
         public double MemoryMb { get; set; }
+        /// <summary>Private committed memory in MB (what actually grows when an app leaks).</summary>
+        public double PrivateMb { get; set; }
         public double PeakMemoryMb { get; set; }
         public double CpuPercent { get; set; }
+        /// <summary>Sustained private-memory growth rate in MB/min.</summary>
         public double LeakRateMbPerMin { get; set; }
         public bool IsLeaking { get; set; }
         public bool IsForeground { get; set; }
@@ -64,6 +73,7 @@ namespace PulseRAM
         public bool IsEco { get; set; }
         public int? CapMb { get; set; }
         public int SmartScore { get; set; }
+        /// <summary>Working set a trim could page out (0 when shielded). An upper bound, not a promise.</summary>
         public double ReclaimableMb { get; set; }
         public string StatusBadge { get; set; } = "BACKGROUND";
         public string StatusColorHex { get; set; } = "#94A3B8";
@@ -76,7 +86,15 @@ namespace PulseRAM
         public string Mode { get; set; } = "smart";
         public string Trigger { get; set; } = "Manual";
         public string Reason { get; set; } = "";
+        /// <summary>
+        /// Measured memory reclaimed: working-set MB actually trimmed, or for a pure standby purge,
+        /// the measured growth of the free page list. Never an estimate.
+        /// </summary>
         public double FreedMb { get; set; }
+        /// <summary>Measured change in "Available" RAM (free + standby).</summary>
+        public double AvailableGainMb { get; set; }
+        /// <summary>Measured change in the free + zero page lists (0 if counters are unavailable).</summary>
+        public double FreeListGainMb { get; set; }
         public double BeforePercent { get; set; }
         public double AfterPercent { get; set; }
         public int ProcessesTrimmed { get; set; }
@@ -84,6 +102,10 @@ namespace PulseRAM
         public bool StandbyPurged { get; set; }
         public bool ModifiedFlushed { get; set; }
         public bool PagesCombined { get; set; }
+        /// <summary>True when nothing was done (e.g. a kernel-only mode without administrator rights).</summary>
+        public bool Skipped { get; set; }
+        /// <summary>Extra human-readable detail, e.g. why the kernel purge was skipped.</summary>
+        public string Note { get; set; } = "";
     }
 
     public class TelemetryPoint
@@ -110,14 +132,30 @@ namespace PulseRAM
 
     public class EngineConfig
     {
+        public const int CurrentVersion = 2;
+        public const string DefaultHotkeyPrimary = "Ctrl+Alt+Shift+M";
+        public const string DefaultHotkeySecondary = "Ctrl+Alt+Shift+P";
+
+        /// <summary>Absent in v1 files, so it defaults to 1 and triggers migration; saved files carry CurrentVersion.</summary>
+        public int ConfigVersion { get; set; } = 1;
         public bool AutoEnabled { get; set; } = true;
         public int RamThresholdPercent { get; set; } = 80;
-        public double MinFreeRamGb { get; set; } = 2.0;
-        public int CooldownSeconds { get; set; } = 30;
+        public double MinFreeRamGb { get; set; } = 1.0;
+        /// <summary>Base Auto-Pilot cooldown. Doubles automatically (up to 30 min) while sweeps fail to relieve pressure.</summary>
+        public int CooldownSeconds { get; set; } = 120;
         public string AutoMode { get; set; } = "smart";
         public bool ProtectForeground { get; set; } = true;
+        /// <summary>Smart mode only trims processes using less CPU than this (i.e. idle ones).</summary>
+        public double IdleCpuCeilingPercent { get; set; } = 2.5;
+        /// <summary>Smart mode ignores processes with a smaller working set than this.</summary>
+        public double MinProcessWorkingSetMb { get; set; } = 15.0;
+        /// <summary>Skip Auto-Pilot sweeps while total CPU is above CpuGuardPercent (trimming adds page faults to a busy system).</summary>
+        public bool PauseOnHighCpu { get; set; } = true;
+        public double CpuGuardPercent { get; set; } = 75.0;
         public bool AutoLeakRemediation { get; set; } = true;
         public double LeakVelocityThresholdMbMin { get; set; } = 120.0;
+        public int LeakGuardCooldownSeconds { get; set; } = 300;
+        public int CapGuardCooldownSeconds { get; set; } = 60;
         public bool ScheduledTrimEnabled { get; set; } = false;
         public int ScheduledIntervalMinutes { get; set; } = 15;
         public bool AutoSoundChime { get; set; } = false;
@@ -127,12 +165,30 @@ namespace PulseRAM
         public bool ProfilesAutoSwitch { get; set; } = true;
         public string ForcedProfileId { get; set; } = "";
         public bool HotkeysEnabled { get; set; } = true;
-        public string HotkeyPrimary { get; set; } = "Ctrl+Shift+M";
-        public string HotkeySecondary { get; set; } = "Ctrl+Shift+P";
+        public string HotkeyPrimary { get; set; } = DefaultHotkeyPrimary;
+        public string HotkeySecondary { get; set; } = DefaultHotkeySecondary;
         public List<string> ProtectedApps { get; set; } = new List<string>();
         public List<string> EcoApps { get; set; } = new List<string>();
         public Dictionary<string, int> AppMemoryCapsMb { get; set; } = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         public List<WorkloadProfile> Profiles { get; set; } = new List<WorkloadProfile>();
+        /// <summary>"auto" (lite on low-end PCs), "lite" (no ambient animation, slower refresh) or "full".</summary>
+        public string UiMode { get; set; } = "auto";
+        /// <summary>Tier the defaults were tuned for on first run ("low", "mid", "high"; empty = not tuned).</summary>
+        public string TunedForTier { get; set; } = "";
+    }
+
+    public enum DeviceTier { Low, Mid, High }
+
+    /// <summary>What kind of PC we are on, used to pick sensible defaults and the UI weight.</summary>
+    public sealed class DeviceInfo
+    {
+        public double RamGb { get; init; }
+        public int LogicalCores { get; init; }
+        public DeviceTier Tier { get; init; }
+
+        public string TierName => Tier switch { DeviceTier.Low => "low", DeviceTier.Mid => "mid", _ => "high" };
+        public string Label => $"{Math.Round(RamGb):0} GB · {LogicalCores} threads · " +
+            (Tier switch { DeviceTier.Low => "Low-end", DeviceTier.Mid => "Mid-range", _ => "High-end" });
     }
 
     public sealed class NativeMemoryEngine : IDisposable
@@ -222,6 +278,9 @@ namespace PulseRAM
         private static extern bool SetProcessWorkingSetSizeEx(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize, uint Flags);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessWorkingSetSizeEx(IntPtr hProcess, out IntPtr lpMinimumWorkingSetSize, out IntPtr lpMaximumWorkingSetSize, out uint Flags);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetPriorityClass(IntPtr hProcess, uint dwPriorityClass);
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -238,6 +297,17 @@ namespace PulseRAM
 
         [DllImport("ntdll.dll")]
         private static extern int NtResumeProcess(IntPtr ProcessHandle);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FILETIME
+        {
+            public uint Low;
+            public uint High;
+            public ulong Value => ((ulong)High << 32) | Low;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetSystemTimes(out FILETIME lpIdleTime, out FILETIME lpKernelTime, out FILETIME lpUserTime);
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
@@ -257,7 +327,6 @@ namespace PulseRAM
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
 
-        private const uint PROCESS_QUERY_INFORMATION = 0x0400;
         private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
         private const uint PROCESS_SET_QUOTA = 0x0100;
         private const uint PROCESS_SET_INFORMATION = 0x0200;
@@ -265,6 +334,14 @@ namespace PulseRAM
         private const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
         private const uint TOKEN_QUERY = 0x0008;
         private const uint SE_PRIVILEGE_ENABLED = 0x00000002;
+        private const int ERROR_NOT_ALL_ASSIGNED = 1300;
+
+        // EmptyWorkingSet / SetProcessWorkingSetSizeEx require QUERY(_LIMITED) + SET_QUOTA.
+        private const uint TRIM_ACCESS = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA;
+
+        private const uint QUOTA_LIMITS_HARDWS_MIN_DISABLE = 0x00000002;
+        private const uint QUOTA_LIMITS_HARDWS_MAX_ENABLE = 0x00000004;
+        private const uint QUOTA_LIMITS_HARDWS_MAX_DISABLE = 0x00000008;
 
         private const uint IDLE_PRIORITY_CLASS = 0x00000040;
         private const uint NORMAL_PRIORITY_CLASS = 0x00000020;
@@ -274,49 +351,259 @@ namespace PulseRAM
 
         private const int SystemMemoryListInformation = 80;
         private const int SystemCombinePhysicalMemoryInformation = 130;
-        private const int MemoryEmptyWorkingSets = 2;
         private const int MemoryFlushModifiedList = 3;
         private const int MemoryPurgeStandbyList = 4;
         private const int MemoryPurgeLowPriorityStandbyList = 5;
 
         #endregion
 
+        #region Memory-list performance counters (PDH)
+
+        /// <summary>
+        /// Reads the real Standby and Free/Zero page-list sizes from the built-in "Memory" performance
+        /// counters. These are readable without administrator rights.
+        /// </summary>
+        private sealed class MemoryListCounters : IDisposable
+        {
+            [DllImport("pdh.dll", CharSet = CharSet.Unicode)]
+            private static extern uint PdhOpenQueryW(string? szDataSource, IntPtr dwUserData, out IntPtr phQuery);
+
+            [DllImport("pdh.dll", CharSet = CharSet.Unicode)]
+            private static extern uint PdhAddEnglishCounterW(IntPtr hQuery, string szFullCounterPath, IntPtr dwUserData, out IntPtr phCounter);
+
+            [DllImport("pdh.dll")]
+            private static extern uint PdhCollectQueryData(IntPtr hQuery);
+
+            [DllImport("pdh.dll")]
+            private static extern uint PdhGetFormattedCounterValue(IntPtr hCounter, uint dwFormat, IntPtr lpdwType, out PDH_FMT_COUNTERVALUE pValue);
+
+            [DllImport("pdh.dll")]
+            private static extern uint PdhCloseQuery(IntPtr hQuery);
+
+            [StructLayout(LayoutKind.Explicit)]
+            private struct PDH_FMT_COUNTERVALUE
+            {
+                [FieldOffset(0)] public uint CStatus;
+                [FieldOffset(8)] public long LargeValue;
+            }
+
+            private const uint PDH_FMT_LARGE = 0x00000400;
+
+            private readonly object _gate = new object();
+            private IntPtr _query = IntPtr.Zero;
+            private readonly List<IntPtr> _standbyCounters = new List<IntPtr>();
+            private IntPtr _freeCounter = IntPtr.Zero;
+
+            public bool IsAvailable { get; }
+
+            public MemoryListCounters()
+            {
+                try
+                {
+                    if (PdhOpenQueryW(null, IntPtr.Zero, out _query) != 0) return;
+                    foreach (var path in new[]
+                    {
+                        @"\Memory\Standby Cache Core Bytes",
+                        @"\Memory\Standby Cache Normal Priority Bytes",
+                        @"\Memory\Standby Cache Reserve Bytes"
+                    })
+                    {
+                        if (PdhAddEnglishCounterW(_query, path, IntPtr.Zero, out IntPtr c) == 0)
+                            _standbyCounters.Add(c);
+                    }
+                    PdhAddEnglishCounterW(_query, @"\Memory\Free & Zero Page List Bytes", IntPtr.Zero, out _freeCounter);
+                    IsAvailable = _standbyCounters.Count == 3 && _freeCounter != IntPtr.Zero && PdhCollectQueryData(_query) == 0;
+                }
+                catch
+                {
+                    IsAvailable = false;
+                }
+            }
+
+            public bool TryRead(out double standbyBytes, out double freeBytes)
+            {
+                standbyBytes = 0;
+                freeBytes = 0;
+                if (!IsAvailable) return false;
+                lock (_gate)
+                {
+                    try
+                    {
+                        if (PdhCollectQueryData(_query) != 0) return false;
+                        foreach (var c in _standbyCounters)
+                        {
+                            if (PdhGetFormattedCounterValue(c, PDH_FMT_LARGE, IntPtr.Zero, out var v) != 0) return false;
+                            standbyBytes += v.LargeValue;
+                        }
+                        if (PdhGetFormattedCounterValue(_freeCounter, PDH_FMT_LARGE, IntPtr.Zero, out var f) != 0) return false;
+                        freeBytes = f.LargeValue;
+                        return true;
+                    }
+                    catch
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            public void Dispose()
+            {
+                lock (_gate)
+                {
+                    if (_query != IntPtr.Zero)
+                    {
+                        try { PdhCloseQuery(_query); } catch { }
+                        _query = IntPtr.Zero;
+                    }
+                }
+            }
+        }
+
+        #endregion
+
+        #region Process name sets
+
+        // Stored as BASE names (no ".exe"). Process.ProcessName never includes the extension and
+        // pseudo-processes such as "Registry" and "Memory Compression" have none, so every check
+        // goes through BaseName() to compare like with like.
         private static readonly HashSet<string> CriticalSystemProcesses = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "System", "Idle", "Registry", "Memory Compression", "smss.exe", "csrss.exe",
-            "wininit.exe", "services.exe", "lsass.exe", "lsm.exe", "winlogon.exe",
-            "dwm.exe", "fontdrvhost.exe", "audiodg.exe", "WUDFHost.exe", " spoolsv.exe",
-            "PulseRAM.exe"
+            "System", "Idle", "Registry", "Memory Compression", "Secure System",
+            "smss", "csrss", "wininit", "services", "lsass", "LsaIso", "lsm", "winlogon",
+            "dwm", "fontdrvhost", "audiodg", "WUDFHost", "spoolsv", "MsMpEng",
+            "PulseRAM"
         };
 
         private static readonly HashSet<string> UnfreezableProcesses = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "System", "Idle", "Registry", "Memory Compression", "smss.exe", "csrss.exe",
-            "wininit.exe", "services.exe", "lsass.exe", "winlogon.exe", "dwm.exe",
-            "explorer.exe", "svchost.exe", "taskmgr.exe", "sihost.exe", "ctfmon.exe",
-            "ShellExperienceHost.exe", "StartMenuExperienceHost.exe", "SearchHost.exe",
-            "audiodg.exe", "PulseRAM.exe"
+            "explorer", "svchost", "taskmgr", "sihost", "ctfmon", "ShellExperienceHost",
+            "StartMenuExperienceHost", "SearchHost", "RuntimeBroker", "TextInputHost",
+            "conhost", "dllhost", "ApplicationFrameHost"
         };
 
+        private static string BaseName(string name) =>
+            name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name.Substring(0, name.Length - 4) : name;
+
+        private static string ExeName(string processName) =>
+            processName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? processName : processName + ".exe";
+
+        private static bool IsCritical(string name) => CriticalSystemProcesses.Contains(BaseName(name));
+
+        private static bool IsUnfreezable(string name) => IsCritical(name) || UnfreezableProcesses.Contains(BaseName(name));
+
+        #endregion
+
+        #region Frozen-process journal
+
+        private sealed class FrozenRecord
+        {
+            public string Name { get; set; } = "";
+            public int Pid { get; set; }
+            public long StartTicksUtc { get; set; }
+        }
+
+        public static string DataDirectory =>
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PulseRAM");
+
+        private static string FrozenJournalPath => Path.Combine(DataDirectory, "frozen_processes.json");
+
+        private static List<FrozenRecord> ReadFrozenJournal()
+        {
+            try
+            {
+                if (!File.Exists(FrozenJournalPath)) return new List<FrozenRecord>();
+                return JsonSerializer.Deserialize<List<FrozenRecord>>(File.ReadAllText(FrozenJournalPath)) ?? new List<FrozenRecord>();
+            }
+            catch
+            {
+                return new List<FrozenRecord>();
+            }
+        }
+
+        private static void WriteFrozenJournal(List<FrozenRecord> records)
+        {
+            try
+            {
+                if (records.Count == 0)
+                {
+                    if (File.Exists(FrozenJournalPath)) File.Delete(FrozenJournalPath);
+                    return;
+                }
+                Directory.CreateDirectory(DataDirectory);
+                File.WriteAllText(FrozenJournalPath, JsonSerializer.Serialize(records));
+            }
+            catch { }
+        }
+
+        private static long TryGetStartTicks(Process proc)
+        {
+            try { return proc.StartTime.ToUniversalTime().Ticks; } catch { return 0; }
+        }
+
+        /// <summary>
+        /// Resumes every process a previous PulseRAM session suspended but never thawed (crash, kill,
+        /// upgrade or uninstall). Matches PID, name and start time so an unrelated process that reused
+        /// the PID is never touched. Safe to call when nothing is frozen.
+        /// </summary>
+        public static int RecoverFrozenProcesses()
+        {
+            var records = ReadFrozenJournal();
+            if (records.Count == 0) return 0;
+
+            int resumed = 0;
+            // Records for processes that still exist but could not be resumed (e.g. an elevated app frozen
+            // by an elevated PulseRAM, and we are now running as a standard user) are KEPT so a later
+            // elevated run can still resume them.
+            var stillSuspended = new List<FrozenRecord>();
+            foreach (var rec in records)
+            {
+                switch (TryResumeRecord(rec))
+                {
+                    case ResumeResult.Resumed: resumed++; break;
+                    case ResumeResult.Failed: stillSuspended.Add(rec); break;
+                    case ResumeResult.Gone: break;
+                }
+            }
+            WriteFrozenJournal(stillSuspended);
+            return resumed;
+        }
+
+        #endregion
+
         private readonly string _configPath;
-        private readonly object _lock = new object();
-        private readonly object _scanLock = new object();
+        private readonly string _seedConfigPath;
+        private readonly string _legacyConfigPath;
+
+        private readonly object _lock = new object();          // events, telemetry, cached lists
+        private readonly object _stateLock = new object();     // config collections, frozen/eco/shield sets
+        private readonly object _scanLock = new object();      // process scan state
+        private readonly object _optimizeLock = new object();  // serialises trims so manual + auto never overlap
+        private readonly object _freezeLock = new object();    // serialises freeze/thaw decisions
+
         private readonly List<OptimizationEvent> _events = new List<OptimizationEvent>();
         private readonly List<TelemetryPoint> _telemetry = new List<TelemetryPoint>();
-        private readonly Dictionary<string, List<(DateTime Time, double MemMb)>> _appHistory = new Dictionary<string, List<(DateTime, double)>>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, List<(DateTime Time, double PrivateMb)>> _appHistory = new Dictionary<string, List<(DateTime, double)>>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _frozenApps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<FrozenRecord> _frozenRecords = new List<FrozenRecord>();
         private readonly HashSet<string> _ecoApps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private HashSet<string> _profileShields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> _lastCapAction = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> _lastLeakAction = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
 
         private readonly Dictionary<int, (DateTime Time, TimeSpan CpuTime)> _procCpuSamples = new Dictionary<int, (DateTime, TimeSpan)>();
+        private volatile Dictionary<int, double> _lastPidCpu = new Dictionary<int, double>();
         private TimeSpan _lastTotalProcCpu = TimeSpan.Zero;
         private DateTime _lastCpuSampleTime = DateTime.MinValue;
         private double _cachedSystemCpuPercent = 0.0;
+        private ulong _lastSysIdle, _lastSysKernel, _lastSysUser;
 
         private List<ProcessItem> _cachedGroupedProcesses = new List<ProcessItem>();
         private List<ProcessItem> _cachedIndividualProcesses = new List<ProcessItem>();
         private DateTime _lastProcessScan = DateTime.MinValue;
+        private volatile MemorySnapshot _lastSnapshot = new MemorySnapshot();
 
         private DateTime _lastAutoOptimizeTime = DateTime.MinValue;
+        private int _autoBackoffLevel = 0;
         private DateTime _lastScheduledSweepTime = DateTime.Now;
         private double _sessionFreedMb = 0.0;
         private int _optimizationCount = 0;
@@ -325,23 +612,50 @@ namespace PulseRAM
         private WorkloadProfile? _activeMatchedProfile = null;
         private string _lastLaunchedProfileId = "";
 
+        private readonly MemoryListCounters _memCounters;
         private Timer? _backgroundTimer;
+        private int _tickRunning = 0;
+        private bool _disposed = false;
+
         public EngineConfig Config { get; private set; } = new EngineConfig();
 
         public event Action<OptimizationEvent>? OnOptimizationCompleted;
 
         public NativeMemoryEngine()
         {
-            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            _configPath = Path.Combine(baseDir, "pulseram_config.json");
+            Directory.CreateDirectory(DataDirectory);
+            // User settings live in %LocalAppData%\PulseRAM so they always save, even for an all-users install
+            // in Program Files.
+            _configPath = Path.Combine(DataDirectory, "pulseram_config.json");
+            // Defaults shipped next to the EXE (always overwritten by the installer).
+            _seedConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "pulseram_defaults.json");
+            // v1.0 kept user settings next to the EXE; imported once if present.
+            _legacyConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "pulseram_config.json");
+
+            // Enable SeDebugPrivilege first so recovery can also resume elevated processes when we're admin.
             CheckAdminAndEnablePrivileges();
+
+            // Resume anything a previous session left suspended before we do anything else.
+            RecoverFrozenProcesses();
+            // Anything we could not resume stays journaled and shows as frozen so the user can thaw it
+            // (e.g. after re-launching as administrator).
+            foreach (var rec in ReadFrozenJournal())
+            {
+                _frozenRecords.Add(rec);
+                _frozenApps.Add(ExeName(rec.Name));
+            }
+
+            Device = DetectDevice();
             LoadConfig();
 
-            // Prime initial process & telemetry sample
-            SampleTelemetryAndProcesses(forceProcessScan: true);
+            _memCounters = new MemoryListCounters();
+
+            _lastSnapshot = SampleTelemetryAndProcesses(forceProcessScan: true, recordTelemetry: true);
 
             _backgroundTimer = new Timer(BackgroundTick, null, 1500, 1500);
         }
+
+        public bool IsAdmin => _isAdmin;
 
         private void CheckAdminAndEnablePrivileges()
         {
@@ -353,10 +667,12 @@ namespace PulseRAM
 
                 if (OpenProcessToken(Process.GetCurrentProcess().Handle, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out IntPtr hToken))
                 {
-                    bool p1 = EnablePrivilege(hToken, "SeProfileSingleProcessPrivilege");
-                    bool p2 = EnablePrivilege(hToken, "SeIncreaseQuotaPrivilege");
-                    bool p3 = EnablePrivilege(hToken, "SeDebugPrivilege");
-                    _privilegesEnabled = _isAdmin && (p1 || p2 || p3);
+                    // SeProfileSingleProcessPrivilege is what NtSetSystemInformation(SystemMemoryListInformation)
+                    // and page combining actually require, so it alone decides whether kernel purges are possible.
+                    bool profile = EnablePrivilege(hToken, "SeProfileSingleProcessPrivilege");
+                    EnablePrivilege(hToken, "SeIncreaseQuotaPrivilege");
+                    EnablePrivilege(hToken, "SeDebugPrivilege");
+                    _privilegesEnabled = _isAdmin && profile;
                     CloseHandle(hToken);
                 }
             }
@@ -379,58 +695,265 @@ namespace PulseRAM
                 Attributes = SE_PRIVILEGE_ENABLED
             };
 
-            return AdjustTokenPrivileges(hToken, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+            // AdjustTokenPrivileges returns TRUE even when the token does not hold the privilege;
+            // ERROR_NOT_ALL_ASSIGNED is the only signal that it was not actually enabled.
+            if (!AdjustTokenPrivileges(hToken, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero))
+                return false;
+            return Marshal.GetLastWin32Error() != ERROR_NOT_ALL_ASSIGNED;
         }
+
+        #region Configuration
 
         public void LoadConfig()
         {
+            bool loadedFromSeed = false;
+            bool freshDefaults = false;
+            EngineConfig? loaded = null;
             try
             {
-                if (File.Exists(_configPath))
+                string? path = null;
+                if (File.Exists(_configPath)) path = _configPath;
+                else if (IsEngineConfigFile(_legacyConfigPath)) path = _legacyConfigPath;
+                else if (File.Exists(_seedConfigPath)) path = _seedConfigPath;
+
+                freshDefaults = path == null || path == _seedConfigPath;
+                if (path != null)
                 {
-                    string json = File.ReadAllText(_configPath);
-                    var loaded = JsonSerializer.Deserialize<EngineConfig>(json, new JsonSerializerOptions
+                    loadedFromSeed = path != _configPath;
+                    try
                     {
-                        PropertyNameCaseInsensitive = true
-                    });
-                    if (loaded != null)
+                        loaded = JsonSerializer.Deserialize<EngineConfig>(File.ReadAllText(path), JsonReadOptions);
+                    }
+                    catch when (path == _configPath)
                     {
-                        Config = loaded;
+                        // Keep a copy of an unreadable user config before defaults overwrite it.
+                        try { File.Copy(_configPath, Path.Combine(DataDirectory, $"pulseram_config.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}.json"), true); } catch { }
+                        loaded = null;
                     }
                 }
             }
             catch
             {
-                Config = new EngineConfig();
+                loaded = null;
             }
 
-            if (Config.Profiles == null || Config.Profiles.Count == 0)
+            var cfg = loaded ?? new EngineConfig();
+
+            cfg.Profiles ??= new List<WorkloadProfile>();
+            if (cfg.Profiles.Count == 0) cfg.Profiles = GetDefaultProfiles();
+            foreach (var p in cfg.Profiles) p.MatchExes ??= new List<string>();
+
+            cfg.ProtectedApps ??= new List<string>();
+            if (cfg.ProtectedApps.Count == 0)
+                cfg.ProtectedApps = new List<string> { "explorer.exe", "dwm.exe", "audiodg.exe" };
+
+            cfg.EcoApps ??= new List<string>();
+            // JSON deserialisation creates a case-sensitive dictionary; process names are case-insensitive.
+            cfg.AppMemoryCapsMb = new Dictionary<string, int>(cfg.AppMemoryCapsMb ?? new Dictionary<string, int>(), StringComparer.OrdinalIgnoreCase);
+
+            bool needsSave = loaded == null || loadedFromSeed || cfg.ConfigVersion < EngineConfig.CurrentVersion;
+            MigrateConfig(cfg);
+            if (freshDefaults || loaded == null) ApplyDeviceTuning(cfg, Device);
+            if (cfg.UiMode is not ("auto" or "lite" or "full")) cfg.UiMode = "auto";
+            ClampConfig(cfg);
+
+            lock (_stateLock)
             {
-                Config.Profiles = GetDefaultProfiles();
+                Config = cfg;
+                _ecoApps.Clear();
+                foreach (var app in cfg.EcoApps) _ecoApps.Add(app);
             }
 
-            if (Config.ProtectedApps == null || Config.ProtectedApps.Count == 0)
+            bool hasElevatedTask = ElevatedStartupTaskExists();
+            bool hasRunKey = CheckWindowsStartupRegistry();
+            if (hasElevatedTask && hasRunKey)
             {
-                Config.ProtectedApps = new List<string> { "explorer.exe", "dwm.exe", "audiodg.exe" };
+                // e.g. an upgrade re-added the installer's Run-key entry: a non-elevated copy started from it
+                // could win the single-instance race against the elevated task, so drop it.
+                try { SetRunKey(false, ""); hasRunKey = false; } catch { }
             }
+            Config.RunOnStartup = hasElevatedTask || hasRunKey;
 
-            _ecoApps.Clear();
-            if (Config.EcoApps != null)
+            if (needsSave)
             {
-                foreach (var app in Config.EcoApps)
-                    _ecoApps.Add(app);
+                Config.ConfigVersion = EngineConfig.CurrentVersion;
+                SaveConfig();
             }
-
-            Config.RunOnStartup = CheckWindowsStartupRegistry();
         }
+
+        private static readonly JsonSerializerOptions JsonReadOptions = new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true,
+            ReadCommentHandling = JsonCommentHandling.Skip,
+            AllowTrailingCommas = true
+        };
+
+        /// <summary>
+        /// True only for a file written in EngineConfig's own schema. v1.0 also shipped a snake_case file
+        /// with the same name whose keys the engine never understood; that one is ignored.
+        /// </summary>
+        private static bool IsEngineConfigFile(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return false;
+                using var doc = JsonDocument.Parse(File.ReadAllText(path), new JsonDocumentOptions
+                {
+                    CommentHandling = JsonCommentHandling.Skip,
+                    AllowTrailingCommas = true
+                });
+                if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+                return doc.RootElement.EnumerateObject().Any(p =>
+                    p.Name.Equals(nameof(EngineConfig.RamThresholdPercent), StringComparison.OrdinalIgnoreCase) ||
+                    p.Name.Equals(nameof(EngineConfig.AutoEnabled), StringComparison.OrdinalIgnoreCase));
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void MigrateConfig(EngineConfig cfg)
+        {
+            if (cfg.ConfigVersion >= EngineConfig.CurrentVersion) return;
+
+            // v1 shipped aggressive defaults that trimmed every 30 s on low-RAM PCs.
+            if (cfg.CooldownSeconds < 120) cfg.CooldownSeconds = 120;
+            if (Math.Abs(cfg.MinFreeRamGb - 2.0) < 0.01) cfg.MinFreeRamGb = 1.0;
+
+            // v1 hard-coded Ctrl+Shift+M / Ctrl+Shift+P, which collide with Teams (mute) and VS Code (command palette).
+            if (string.IsNullOrWhiteSpace(cfg.HotkeyPrimary) || cfg.HotkeyPrimary.Replace(" ", "").Equals("Ctrl+Shift+M", StringComparison.OrdinalIgnoreCase))
+                cfg.HotkeyPrimary = EngineConfig.DefaultHotkeyPrimary;
+            if (string.IsNullOrWhiteSpace(cfg.HotkeySecondary) || cfg.HotkeySecondary.Replace(" ", "").Equals("Ctrl+Shift+P", StringComparison.OrdinalIgnoreCase))
+                cfg.HotkeySecondary = EngineConfig.DefaultHotkeySecondary;
+
+            // v1 permanently copied auto-shielded profile EXEs (games, editors…) into ProtectedApps.
+            // Shields are now temporary while a profile is active, so remove those leftovers.
+            var profileExes = new HashSet<string>(
+                cfg.Profiles.Where(p => p.AutoShieldMatched).SelectMany(p => p.MatchExes),
+                StringComparer.OrdinalIgnoreCase);
+            cfg.ProtectedApps.RemoveAll(app => profileExes.Contains(app));
+
+            cfg.ConfigVersion = EngineConfig.CurrentVersion;
+        }
+
+        private static void ClampConfig(EngineConfig cfg)
+        {
+            cfg.RamThresholdPercent = Math.Clamp(cfg.RamThresholdPercent, 50, 95);
+            cfg.MinFreeRamGb = Math.Clamp(cfg.MinFreeRamGb, 0.5, 8.0);
+            cfg.CooldownSeconds = Math.Clamp(cfg.CooldownSeconds, 30, 3600);
+            cfg.IdleCpuCeilingPercent = Math.Clamp(cfg.IdleCpuCeilingPercent, 0.1, 50.0);
+            cfg.MinProcessWorkingSetMb = Math.Clamp(cfg.MinProcessWorkingSetMb, 0.0, 4096.0);
+            cfg.CpuGuardPercent = Math.Clamp(cfg.CpuGuardPercent, 30.0, 100.0);
+            cfg.LeakVelocityThresholdMbMin = Math.Clamp(cfg.LeakVelocityThresholdMbMin, 10.0, 10000.0);
+            cfg.LeakGuardCooldownSeconds = Math.Clamp(cfg.LeakGuardCooldownSeconds, 60, 3600);
+            cfg.CapGuardCooldownSeconds = Math.Clamp(cfg.CapGuardCooldownSeconds, 15, 3600);
+            cfg.ScheduledIntervalMinutes = Math.Clamp(cfg.ScheduledIntervalMinutes, 5, 1440);
+            cfg.FocusBoostThresholdPercent = Math.Clamp(cfg.FocusBoostThresholdPercent, 50, 95);
+            if (!IsKnownMode(cfg.AutoMode)) cfg.AutoMode = "smart";
+            foreach (var p in cfg.Profiles)
+            {
+                p.RamThresholdPercent = Math.Clamp(p.RamThresholdPercent, 50, 95);
+                if (!IsKnownMode(p.AutoMode)) p.AutoMode = "smart";
+            }
+        }
+
+        private static bool IsKnownMode(string? mode) =>
+            mode is "smart" or "deep" or "standby" or "max";
+
+        /// <summary>
+        /// Low-end: under ~7 GB RAM or ≤ 2 threads. Mid-range: under ~15 GB (typically 8 GB) or ≤ 4 threads.
+        /// High-end: everything else (16 GB+).
+        /// </summary>
+        public static DeviceInfo DetectDevice()
+        {
+            var ms = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
+            double ramGb = GlobalMemoryStatusEx(ref ms) ? ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0) : 8.0;
+            int cores = Math.Max(1, Environment.ProcessorCount);
+            DeviceTier tier = (ramGb < 7.0 || cores <= 2) ? DeviceTier.Low
+                : (ramGb < 15.0 || cores <= 4) ? DeviceTier.Mid
+                : DeviceTier.High;
+            return new DeviceInfo { RamGb = ramGb, LogicalCores = cores, Tier = tier };
+        }
+
+        /// <summary>
+        /// Picks thresholds that suit the hardware. Low-RAM PCs normally sit at a high memory load, so they get
+        /// a higher trigger, a smaller floor and a longer cooldown (otherwise Auto-Pilot would trim constantly and
+        /// make the PC slower). Big-RAM PCs can afford a larger free-memory floor. Profile triggers are raised
+        /// by the same margin so an always-matching profile (e.g. a browser) can't undo this.
+        /// </summary>
+        public static void ApplyDeviceTuning(EngineConfig cfg, DeviceInfo device)
+        {
+            int profileBump;
+            switch (device.Tier)
+            {
+                case DeviceTier.Low:
+                    cfg.RamThresholdPercent = 88;
+                    cfg.MinFreeRamGb = 0.5;
+                    cfg.CooldownSeconds = 300;
+                    cfg.MinProcessWorkingSetMb = 30.0;
+                    profileBump = 10;
+                    break;
+                case DeviceTier.Mid:
+                    cfg.RamThresholdPercent = 85;
+                    cfg.MinFreeRamGb = 0.75;
+                    cfg.CooldownSeconds = 180;
+                    cfg.MinProcessWorkingSetMb = 20.0;
+                    profileBump = 5;
+                    break;
+                default:
+                    cfg.RamThresholdPercent = 80;
+                    cfg.MinFreeRamGb = 1.5;
+                    cfg.CooldownSeconds = 120;
+                    cfg.MinProcessWorkingSetMb = 15.0;
+                    profileBump = 0;
+                    break;
+            }
+            foreach (var p in cfg.Profiles)
+                p.RamThresholdPercent = Math.Clamp(p.RamThresholdPercent + profileBump, 50, 92);
+            cfg.TunedForTier = device.TierName;
+        }
+
+        /// <summary>Re-applies the hardware-based defaults (thresholds, floor, cooldown, profile triggers).</summary>
+        public void RetuneForThisDevice()
+        {
+            lock (_stateLock)
+            {
+                var fresh = GetDefaultProfiles();
+                // Keep the user's enabled/disabled choice and custom EXE lists; reset only the triggers.
+                foreach (var p in Config.Profiles)
+                {
+                    var d = fresh.FirstOrDefault(f => f.Id == p.Id);
+                    if (d != null) p.RamThresholdPercent = d.RamThresholdPercent;
+                }
+                ApplyDeviceTuning(Config, Device);
+            }
+            _autoBackoffLevel = 0;
+            SaveConfig();
+        }
+
+        public DeviceInfo Device { get; }
+
+        /// <summary>Lightweight mode: explicit "lite", or "auto" on a low-end PC.</summary>
+        public bool LiteMode => Config.UiMode == "lite" || (Config.UiMode != "full" && Device.Tier == DeviceTier.Low);
+
+        /// <summary>Process scans are the most expensive thing we do; halve their rate in lite mode.</summary>
+        private int ScanIntervalMs => LiteMode ? 4400 : 2200;
 
         public void SaveConfig()
         {
             try
             {
-                Config.EcoApps = _ecoApps.ToList();
-                var json = JsonSerializer.Serialize(Config, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(_configPath, json);
+                string json;
+                lock (_stateLock)
+                {
+                    Config.EcoApps = _ecoApps.ToList();
+                    json = JsonSerializer.Serialize(Config, new JsonSerializerOptions { WriteIndented = true });
+                }
+                Directory.CreateDirectory(DataDirectory);
+                string tmp = _configPath + ".tmp";
+                File.WriteAllText(tmp, json);
+                File.Move(tmp, _configPath, overwrite: true);
             }
             catch
             {
@@ -438,16 +961,17 @@ namespace PulseRAM
             }
         }
 
+        /// <summary>Built-in profiles; kept identical to the Profiles in pulseram_defaults.json.</summary>
         private static List<WorkloadProfile> GetDefaultProfiles()
         {
             return new List<WorkloadProfile>
             {
                 new WorkloadProfile
                 {
-                    Id = "gaming_boost",
+                    Id = "gaming-boost",
                     Name = "Gaming Boost",
-                    Description = "Aggressive 68% RAM ceiling, shields active game EXE, and purges background bloat on game launch.",
-                    MatchExes = new List<string> { "cs2.exe", "valorant-win64-shipping.exe", "dota2.exe", "eldenring.exe", "cyberpunk2077.exe", "helldivers2.exe", "fortniteclient-win64-shipping.exe", "gta5.exe", "r5apex.exe", "overwatch.exe" },
+                    Description = "Trims idle background apps on game launch, shields the game process, and sweeps at 68%.",
+                    MatchExes = new List<string> { "cs2.exe", "valorant.exe", "valorant-win64-shipping.exe", "fortniteclient-win64-shipping.exe", "eldenring.exe", "genshinimpact.exe", "starrail.exe", "robloxplayerbeta.exe", "dota2.exe", "league of legends.exe", "r5apex.exe", "cyberpunk2077.exe", "helldivers2.exe", "overwatch.exe", "javaw.exe", "minecraft.windows.exe" },
                     RamThresholdPercent = 68,
                     AutoMode = "smart",
                     AutoShieldMatched = true,
@@ -456,11 +980,11 @@ namespace PulseRAM
                 },
                 new WorkloadProfile
                 {
-                    Id = "creator_pro",
-                    Name = "Creator / Video & 3D",
-                    Description = "Protects NLE & 3D render engines while reclaiming memory from background browsers.",
-                    MatchExes = new List<string> { "premiere.exe", "afterfx.exe", "resolve.exe", "blender.exe", "photoshop.exe", "obs64.exe" },
-                    RamThresholdPercent = 76,
+                    Id = "creator-studio",
+                    Name = "Creator & 3D Studio",
+                    Description = "Shields active rendering/editing apps while trimming idle background apps at 72%.",
+                    MatchExes = new List<string> { "blender.exe", "afterfx.exe", "adobe premiere pro.exe", "photoshop.exe", "resolve.exe", "unrealeditor.exe", "unity.exe", "obs64.exe" },
+                    RamThresholdPercent = 72,
                     AutoMode = "smart",
                     AutoShieldMatched = true,
                     BoostOnLaunch = true,
@@ -468,11 +992,11 @@ namespace PulseRAM
                 },
                 new WorkloadProfile
                 {
-                    Id = "dev_workstation",
-                    Name = "Heavy Dev & AI",
-                    Description = "Balanced 82% threshold designed for IDEs, Docker containers, and local LLM workloads.",
-                    MatchExes = new List<string> { "devenv.exe", "rider64.exe", "idea64.exe", "ollama.exe", "lm studio.exe" },
-                    RamThresholdPercent = 82,
+                    Id = "dev-workstation",
+                    Name = "Dev & Local AI",
+                    Description = "Shields your IDE and local LLM runners while trimming idle helpers at 76%.",
+                    MatchExes = new List<string> { "code.exe", "devenv.exe", "idea64.exe", "pycharm64.exe", "ollama.exe", "lm-studio.exe", "docker.exe" },
+                    RamThresholdPercent = 76,
                     AutoMode = "smart",
                     AutoShieldMatched = true,
                     BoostOnLaunch = false,
@@ -480,26 +1004,33 @@ namespace PulseRAM
                 },
                 new WorkloadProfile
                 {
-                    Id = "low_ram_saver",
-                    Name = "Ultra Low-RAM Guard",
-                    Description = "Tight 65% threshold with Deep Sweep + Standby Cache purge for high-pressure multitasking.",
-                    MatchExes = new List<string>(),
-                    RamThresholdPercent = 65,
-                    AutoMode = "deep",
-                    AutoShieldMatched = true,
+                    Id = "browser-tamer",
+                    Name = "Browser Tab Tamer",
+                    Description = "Trims idle browser subprocesses when total memory passes 78%.",
+                    MatchExes = new List<string> { "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe" },
+                    RamThresholdPercent = 78,
+                    AutoMode = "smart",
+                    AutoShieldMatched = false,
                     BoostOnLaunch = false,
                     Enabled = true
                 }
             };
         }
 
+        #endregion
+
+        #region Background loop: Auto-Pilot, schedule, caps, leak guard
+
         private void BackgroundTick(object? state)
         {
+            // System.Threading.Timer does not wait for the previous callback; never run two ticks at once.
+            if (Interlocked.Exchange(ref _tickRunning, 1) == 1) return;
             try
             {
-                var snap = SampleTelemetryAndProcesses(forceProcessScan: false);
+                if (_disposed) return;
+                var snap = SampleTelemetryAndProcesses(forceProcessScan: false, recordTelemetry: true);
 
-                // 1. Check Scheduled Maintenance Timer
+                // 1. Scheduled maintenance sweep
                 if (Config.ScheduledTrimEnabled && Config.ScheduledIntervalMinutes > 0)
                 {
                     double elapsedSec = (DateTime.Now - _lastScheduledSweepTime).TotalSeconds;
@@ -511,37 +1042,58 @@ namespace PulseRAM
                     }
                 }
 
-                // 2. Check Auto-Pilot Thresholds
+                // 2. Auto-Pilot thresholds with adaptive back-off
                 if (Config.AutoEnabled)
                 {
-                    double cooldownSec = (DateTime.Now - _lastAutoOptimizeTime).TotalSeconds;
-                    if (cooldownSec >= Math.Max(10, Config.CooldownSeconds))
+                    int effectiveThreshold = snap.EffectiveThresholdPercent;
+                    bool overPercent = snap.Percent >= effectiveThreshold;
+                    bool underFreeFloor = snap.AvailableGb <= Config.MinFreeRamGb;
+
+                    if (!overPercent && !underFreeFloor)
                     {
-                        int effectiveThreshold = snap.EffectiveThresholdPercent;
-                        string effectiveMode = snap.EffectiveMode;
-
-                        bool overPercent = snap.Percent >= effectiveThreshold;
-                        bool underFreeFloor = snap.AvailableGb <= Config.MinFreeRamGb;
-
-                        if (overPercent || underFreeFloor)
+                        // Pressure has cleared with some margin: reset the back-off.
+                        if (snap.Percent < effectiveThreshold - 5 && snap.AvailableGb > Config.MinFreeRamGb + 0.5)
+                            _autoBackoffLevel = 0;
+                    }
+                    else if ((DateTime.Now - _lastAutoOptimizeTime).TotalSeconds >= EffectiveCooldownSeconds())
+                    {
+                        bool cpuBusy = Config.PauseOnHighCpu && snap.CpuPercent >= Config.CpuGuardPercent;
+                        if (!cpuBusy)
                         {
                             _lastAutoOptimizeTime = DateTime.Now;
                             string reason = overPercent
                                 ? $"RAM reached {snap.Percent:F1}% (Threshold: {effectiveThreshold}%)"
                                 : $"Available RAM dropped to {snap.AvailableGb:F2} GB (Floor: {Config.MinFreeRamGb:F1} GB)";
-                            OptimizeMemory(effectiveMode, "Auto-Pilot", reason);
+                            var ev = OptimizeMemory(snap.EffectiveMode, "Auto-Pilot", reason);
+
+                            // If the sweep did not get us back under the trigger, the memory is genuinely in use:
+                            // trimming again soon would only cause page-fault churn, so back off exponentially.
+                            var after = _lastSnapshot;
+                            bool stillPressured = after.Percent >= effectiveThreshold || after.AvailableGb <= Config.MinFreeRamGb;
+                            if (stillPressured || ev.Skipped)
+                                _autoBackoffLevel = Math.Min(_autoBackoffLevel + 1, 6);
                             return;
                         }
                     }
                 }
 
-                // 3. Enforce Per-App Memory Caps & Runaway Leak Guardian
+                // 3. Per-app memory caps & runaway leak guard
                 EnforceAppCapsAndLeakGuard(snap.ForegroundApp);
             }
             catch
             {
                 // Never crash background loop
             }
+            finally
+            {
+                Interlocked.Exchange(ref _tickRunning, 0);
+            }
+        }
+
+        private int EffectiveCooldownSeconds()
+        {
+            double cd = Math.Max(30, Config.CooldownSeconds) * Math.Pow(2, _autoBackoffLevel);
+            return (int)Math.Min(cd, 1800);
         }
 
         private void EnforceAppCapsAndLeakGuard(string foregroundApp)
@@ -552,51 +1104,63 @@ namespace PulseRAM
                 grouped = _cachedGroupedProcesses.ToList();
             }
 
+            Dictionary<string, int> caps;
+            lock (_stateLock)
+            {
+                caps = new Dictionary<string, int>(Config.AppMemoryCapsMb, StringComparer.OrdinalIgnoreCase);
+            }
+
+            var now = DateTime.Now;
+
+            // Per-process hard caps: Windows enforces the limit on processes that already have it, so this only
+            // has to catch NEW processes of a capped app. Checked at most once per CapGuardCooldownSeconds.
+            foreach (var cap in caps)
+            {
+                if (cap.Value < 64 || IsCritical(cap.Key)) continue;
+                bool due;
+                lock (_stateLock)
+                {
+                    due = !_lastCapAction.TryGetValue(cap.Key, out var last) || (now - last).TotalSeconds >= Config.CapGuardCooldownSeconds;
+                    if (due) _lastCapAction[cap.Key] = now;
+                }
+                if (due) EnforceHardCap(cap.Key, cap.Value, force: false);
+            }
+
             foreach (var item in grouped)
             {
                 if (string.Equals(item.Name, foregroundApp, StringComparison.OrdinalIgnoreCase))
                     continue;
-                if (CriticalSystemProcesses.Contains(item.Name))
+                if (IsCritical(item.Name))
                     continue;
 
-                // Per-App Memory Cap check
-                if (Config.AppMemoryCapsMb != null &&
-                    Config.AppMemoryCapsMb.TryGetValue(item.Name, out int capMb) &&
-                    capMb > 50 &&
-                    item.MemoryMb > capMb * 1.08)
-                {
-                    OptimizeSingleApp(item.Name, $"Memory Cap Guard ({item.MemoryMb:F0} MB > {capMb} MB cap)", capMb);
-                    continue;
-                }
-
-                // Runaway Leak Guardian check
+                // Leak guard: sustained growth of PRIVATE memory. Trimming only relieves physical RAM;
+                // the leaked memory stays committed until the app is restarted, so we say so.
                 if (Config.AutoLeakRemediation &&
                     !item.IsProtected &&
                     item.IsLeaking &&
                     item.LeakRateMbPerMin >= Config.LeakVelocityThresholdMbMin &&
-                    item.MemoryMb >= 300)
+                    item.PrivateMb >= 300)
                 {
-                    if ((DateTime.Now - _lastAutoOptimizeTime).TotalSeconds >= 20)
+                    if (!_lastLeakAction.TryGetValue(item.Name, out var lastLeak) || (now - lastLeak).TotalSeconds >= Config.LeakGuardCooldownSeconds)
                     {
-                        _lastAutoOptimizeTime = DateTime.Now;
-                        OptimizeSingleApp(item.Name, $"Runaway Leak Guard (+{item.LeakRateMbPerMin:F0} MB/min)");
+                        _lastLeakAction[item.Name] = now;
+                        OptimizeSingleApp(item.Name,
+                            $"Leak Guard: private memory growing +{item.LeakRateMbPerMin:F0} MB/min — working set trimmed; restart the app to release leaked memory");
                     }
                 }
             }
         }
 
-        public MemorySnapshot GetSnapshot()
-        {
-            return SampleTelemetryAndProcesses(forceProcessScan: false);
-        }
+        #endregion
 
+        #region Sampling
+
+        /// <summary>Returns the latest snapshot. Cheap: the background loop keeps it fresh, so the UI thread never scans processes.</summary>
+        public MemorySnapshot GetSnapshot() => _lastSnapshot;
+
+        /// <summary>Returns the cached process list (refreshed by the background loop every ~2 s).</summary>
         public List<ProcessItem> GetProcesses(bool grouped = true)
         {
-            if ((DateTime.Now - _lastProcessScan).TotalMilliseconds > 2200)
-            {
-                RefreshProcessSnapshots(GetForegroundProcessInfo().Name);
-            }
-
             lock (_lock)
             {
                 return grouped
@@ -630,10 +1194,7 @@ namespace PulseRAM
                 GetWindowThreadProcessId(hwnd, out int pid);
                 if (pid <= 0) return (0, "");
                 using var proc = Process.GetProcessById(pid);
-                string name = proc.ProcessName;
-                if (!name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                    name += ".exe";
-                return (pid, name);
+                return (pid, ExeName(proc.ProcessName));
             }
             catch
             {
@@ -641,7 +1202,7 @@ namespace PulseRAM
             }
         }
 
-        private MemorySnapshot SampleTelemetryAndProcesses(bool forceProcessScan)
+        private MemorySnapshot SampleTelemetryAndProcesses(bool forceProcessScan, bool recordTelemetry)
         {
             var memStatus = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
             GlobalMemoryStatusEx(ref memStatus);
@@ -649,21 +1210,35 @@ namespace PulseRAM
             var perfInfo = new PERFORMANCE_INFORMATION { cb = (uint)Marshal.SizeOf<PERFORMANCE_INFORMATION>() };
             GetPerformanceInfo(out perfInfo, perfInfo.cb);
 
+            const double GB = 1024.0 * 1024.0 * 1024.0;
             double pageSize = perfInfo.PageSize.ToUInt64() > 0 ? perfInfo.PageSize.ToUInt64() : 4096.0;
-            double totalGb = memStatus.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
-            double availGb = memStatus.ullAvailPhys / (1024.0 * 1024.0 * 1024.0);
+            double totalGb = memStatus.ullTotalPhys / GB;
+            double availGb = memStatus.ullAvailPhys / GB;
             double usedGb = Math.Max(0.0, totalGb - availGb);
             double percent = totalGb > 0 ? (usedGb / totalGb) * 100.0 : memStatus.dwMemoryLoad;
 
-            double standbyCacheGb = (perfInfo.SystemCache.ToUInt64() * pageSize) / (1024.0 * 1024.0 * 1024.0);
-            double freeExactGb = Math.Max(0.0, availGb - standbyCacheGb * 0.65);
+            double standbyGb;
+            double freeGb;
+            bool listsMeasured = false;
+            if (_memCounters != null && _memCounters.TryRead(out double standbyBytes, out double freeBytes))
+            {
+                standbyGb = standbyBytes / GB;
+                freeGb = freeBytes / GB;
+                listsMeasured = true;
+            }
+            else
+            {
+                // Fallback estimate: system file-cache working set. Flagged via MemoryListsMeasured = false.
+                standbyGb = Math.Min(availGb, (perfInfo.SystemCache.ToUInt64() * pageSize) / GB);
+                freeGb = Math.Max(0.0, availGb - standbyGb);
+            }
 
-            double commitTotalGb = (perfInfo.CommitTotal.ToUInt64() * pageSize) / (1024.0 * 1024.0 * 1024.0);
-            double commitLimitGb = Math.Max(0.1, (perfInfo.CommitLimit.ToUInt64() * pageSize) / (1024.0 * 1024.0 * 1024.0));
+            double commitTotalGb = (perfInfo.CommitTotal.ToUInt64() * pageSize) / GB;
+            double commitLimitGb = Math.Max(0.1, (perfInfo.CommitLimit.ToUInt64() * pageSize) / GB);
             double commitPct = (commitTotalGb / commitLimitGb) * 100.0;
 
-            double pfTotalGb = Math.Max(0.0, (memStatus.ullTotalPageFile / (1024.0 * 1024.0 * 1024.0)) - totalGb);
-            double pfAvailGb = Math.Max(0.0, (memStatus.ullAvailPageFile / (1024.0 * 1024.0 * 1024.0)) - availGb);
+            double pfTotalGb = Math.Max(0.0, (memStatus.ullTotalPageFile / GB) - totalGb);
+            double pfAvailGb = Math.Max(0.0, (memStatus.ullAvailPageFile / GB) - availGb);
             double pfUsedGb = Math.Max(0.0, pfTotalGb - pfAvailGb);
             double pfPct = pfTotalGb > 0.05 ? Math.Min(100.0, (pfUsedGb / pfTotalGb) * 100.0) : 0.0;
 
@@ -673,14 +1248,14 @@ namespace PulseRAM
 
             var fg = GetForegroundProcessInfo();
 
-            if (forceProcessScan || (DateTime.Now - _lastProcessScan).TotalMilliseconds >= 2200)
+            if (forceProcessScan || (DateTime.Now - _lastProcessScan).TotalMilliseconds >= ScanIntervalMs)
             {
                 RefreshProcessSnapshots(fg.Name);
             }
 
             string pressure = percent >= 85 ? "CRITICAL" : (percent >= 72 ? "ELEVATED" : "OPTIMAL");
 
-            // Resolve Effective Profile & Threshold
+            // Resolve effective profile & threshold
             string activeProfileName = "Balanced Default";
             int effectiveThreshold = Config.RamThresholdPercent;
             string effectiveMode = Config.AutoMode;
@@ -721,8 +1296,9 @@ namespace PulseRAM
                 TotalGb = Math.Round(totalGb, 2),
                 UsedGb = Math.Round(usedGb, 2),
                 AvailableGb = Math.Round(availGb, 2),
-                StandbyAndCacheGb = Math.Round(standbyCacheGb, 2),
-                FreeExactGb = Math.Round(freeExactGb, 2),
+                StandbyAndCacheGb = Math.Round(standbyGb, 2),
+                FreeExactGb = Math.Round(freeGb, 2),
+                MemoryListsMeasured = listsMeasured,
                 Percent = Math.Round(percent, 1),
                 PressureLevel = pressure,
                 CommitTotalGb = Math.Round(commitTotalGb, 2),
@@ -747,12 +1323,13 @@ namespace PulseRAM
                 ActiveProfileName = activeProfileName,
                 EffectiveThresholdPercent = effectiveThreshold,
                 EffectiveMode = effectiveMode,
-                NextScheduledSeconds = nextSchedSec
+                NextScheduledSeconds = nextSchedSec,
+                EffectiveCooldownSeconds = EffectiveCooldownSeconds()
             };
 
-            lock (_lock)
+            if (recordTelemetry)
             {
-                if (_telemetry.Count == 0 || (DateTime.Now - _lastProcessScan).TotalMilliseconds < 1600)
+                lock (_lock)
                 {
                     _telemetry.Add(new TelemetryPoint
                     {
@@ -762,212 +1339,278 @@ namespace PulseRAM
                         UsedGb = snapshot.UsedGb,
                         StandbyGb = snapshot.StandbyAndCacheGb
                     });
-                    while (_telemetry.Count > 60)
+                    // One point per 1.5 s tick → 40 points ≈ the 60-second window the chart advertises.
+                    while (_telemetry.Count > 40)
                         _telemetry.RemoveAt(0);
                 }
             }
 
+            _lastSnapshot = snapshot;
             return snapshot;
         }
 
-        private void RefreshProcessSnapshots(string foregroundApp)
+        private bool IsUserOrProfileShielded(string exeName)
         {
-            if (!Monitor.TryEnter(_scanLock))
+            lock (_stateLock)
+            {
+                return Config.ProtectedApps.Any(x => string.Equals(x, exeName, StringComparison.OrdinalIgnoreCase))
+                    || _profileShields.Contains(exeName);
+            }
+        }
+
+        private bool IsShielded(string exeName) => IsCritical(exeName) || IsUserOrProfileShielded(exeName);
+
+        private void RefreshProcessSnapshots(string foregroundApp, bool waitForLock = false)
+        {
+            if (waitForLock) Monitor.Enter(_scanLock);
+            else if (!Monitor.TryEnter(_scanLock))
                 return;
             try
             {
-            _lastProcessScan = DateTime.Now;
-            var now = DateTime.Now;
-            int coreCount = Math.Max(1, Environment.ProcessorCount);
+                _lastProcessScan = DateTime.Now;
+                var now = DateTime.Now;
+                int coreCount = Math.Max(1, Environment.ProcessorCount);
 
-            var rawProcesses = Process.GetProcesses();
-            var individual = new List<ProcessItem>(rawProcesses.Length);
-            var runningExeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var rawProcesses = Process.GetProcesses();
+                var individual = new List<ProcessItem>(rawProcesses.Length);
+                var runningExeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var seenPids = new HashSet<int>();
+                var pidCpu = new Dictionary<int, double>(rawProcesses.Length);
 
-            TimeSpan totalCpuSum = TimeSpan.Zero;
-            double cpuDeltaSeconds = (_lastCpuSampleTime == DateTime.MinValue)
-                ? 1.5
-                : Math.Max(0.25, (now - _lastCpuSampleTime).TotalSeconds);
-
-            foreach (var proc in rawProcesses)
-            {
-                try
+                HashSet<string> frozen, eco;
+                Dictionary<string, int> caps;
+                lock (_stateLock)
                 {
-                    int pid = proc.Id;
-                    if (pid <= 4) continue;
+                    frozen = new HashSet<string>(_frozenApps, StringComparer.OrdinalIgnoreCase);
+                    eco = new HashSet<string>(_ecoApps, StringComparer.OrdinalIgnoreCase);
+                    caps = new Dictionary<string, int>(Config.AppMemoryCapsMb, StringComparer.OrdinalIgnoreCase);
+                }
+                bool protectFg = Config.ProtectForeground;
 
-                    string name = proc.ProcessName;
-                    if (!name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                        name += ".exe";
+                TimeSpan totalCpuSum = TimeSpan.Zero;
+                double cpuDeltaSeconds = (_lastCpuSampleTime == DateTime.MinValue)
+                    ? 1.5
+                    : Math.Max(0.25, (now - _lastCpuSampleTime).TotalSeconds);
 
-                    runningExeNames.Add(name);
-
-                    double wsMb = proc.WorkingSet64 / (1024.0 * 1024.0);
-                    if (wsMb < 4.0) continue;
-
-                    double peakMb = proc.PeakWorkingSet64 / (1024.0 * 1024.0);
-                    double procCpuPct = 0.0;
-
+                foreach (var proc in rawProcesses)
+                {
                     try
                     {
-                        TimeSpan totalProcTime = proc.TotalProcessorTime;
-                        totalCpuSum += totalProcTime;
-                        if (_procCpuSamples.TryGetValue(pid, out var prev))
+                        int pid = proc.Id;
+                        if (pid <= 4) continue;
+
+                        string name = ExeName(proc.ProcessName);
+                        runningExeNames.Add(name);
+                        seenPids.Add(pid);
+
+                        double procCpuPct = 0.0;
+                        try
                         {
-                            double dt = (now - prev.Time).TotalSeconds;
-                            if (dt > 0.1)
+                            TimeSpan totalProcTime = proc.TotalProcessorTime;
+                            totalCpuSum += totalProcTime;
+                            if (_procCpuSamples.TryGetValue(pid, out var prev))
                             {
-                                double cpuUsed = (totalProcTime - prev.CpuTime).TotalSeconds;
-                                procCpuPct = Math.Min(100.0, Math.Max(0.0, (cpuUsed / (dt * coreCount)) * 100.0));
+                                double dt = (now - prev.Time).TotalSeconds;
+                                if (dt > 0.1)
+                                {
+                                    double cpuUsed = (totalProcTime - prev.CpuTime).TotalSeconds;
+                                    procCpuPct = Math.Min(100.0, Math.Max(0.0, (cpuUsed / (dt * coreCount)) * 100.0));
+                                    pidCpu[pid] = procCpuPct;
+                                }
                             }
+                            _procCpuSamples[pid] = (now, totalProcTime);
                         }
-                        _procCpuSamples[pid] = (now, totalProcTime);
+                        catch
+                        {
+                            // Protected process CPU time inaccessible
+                        }
+
+                        double wsMb = proc.WorkingSet64 / (1024.0 * 1024.0);
+                        if (wsMb < 4.0) continue;
+
+                        double privMb = proc.PrivateMemorySize64 / (1024.0 * 1024.0);
+                        double peakMb = proc.PeakWorkingSet64 / (1024.0 * 1024.0);
+
+                        bool isFg = string.Equals(name, foregroundApp, StringComparison.OrdinalIgnoreCase);
+                        bool isProt = IsShielded(name);
+                        bool isFrozen = frozen.Contains(name);
+                        bool isEco = eco.Contains(name);
+                        int? capMb = caps.TryGetValue(name, out int c) ? c : null;
+
+                        int score = ComputeSmartScore(wsMb, procCpuPct, 0.0, isFg, isProt);
+                        var (badge, color) = ResolveBadge(isFrozen, isEco, isFg, isProt, false, procCpuPct, score);
+
+                        individual.Add(new ProcessItem
+                        {
+                            Name = name,
+                            Pid = pid,
+                            ProcessCount = 1,
+                            MemoryMb = Math.Round(wsMb, 1),
+                            PrivateMb = Math.Round(privMb, 1),
+                            PeakMemoryMb = Math.Round(peakMb, 1),
+                            CpuPercent = Math.Round(procCpuPct, 1),
+                            IsForeground = isFg,
+                            IsProtected = isProt,
+                            IsFrozen = isFrozen,
+                            IsEco = isEco,
+                            CapMb = capMb,
+                            SmartScore = score,
+                            ReclaimableMb = (isProt || (isFg && protectFg)) ? 0.0 : Math.Round(wsMb, 1),
+                            StatusBadge = badge,
+                            StatusColorHex = color
+                        });
                     }
                     catch
                     {
-                        // Protected process CPU time inaccessible
+                        // Skip inaccessible or exited process
                     }
-
-                    bool isFg = string.Equals(name, foregroundApp, StringComparison.OrdinalIgnoreCase);
-                    bool isProt = Config.ProtectedApps.Contains(name, StringComparer.OrdinalIgnoreCase) || CriticalSystemProcesses.Contains(name);
-                    bool isFrozen = _frozenApps.Contains(name);
-                    bool isEco = _ecoApps.Contains(name);
-                    int? capMb = (Config.AppMemoryCapsMb != null && Config.AppMemoryCapsMb.TryGetValue(name, out int c)) ? c : null;
-
-                    int score = ComputeSmartScore(wsMb, procCpuPct, 0.0, isFg, isProt);
-                    var (badge, color) = ResolveBadge(isFrozen, isEco, isFg, isProt, false, procCpuPct, score);
-
-                    individual.Add(new ProcessItem
+                    finally
                     {
-                        Name = name,
-                        Pid = pid,
-                        ProcessCount = 1,
-                        MemoryMb = Math.Round(wsMb, 1),
-                        PeakMemoryMb = Math.Round(peakMb, 1),
-                        CpuPercent = Math.Round(procCpuPct, 1),
-                        IsForeground = isFg,
-                        IsProtected = isProt,
-                        IsFrozen = isFrozen,
-                        IsEco = isEco,
-                        CapMb = capMb,
-                        SmartScore = score,
-                        ReclaimableMb = isProt ? 0.0 : Math.Round(wsMb * (isFg ? 0.15 : 0.42), 1),
-                        StatusBadge = badge,
-                        StatusColorHex = color
-                    });
+                        proc.Dispose();
+                    }
                 }
-                catch
+
+                // System CPU %: GetSystemTimes covers every process (including ones we can't open) and isn't
+                // skewed by processes starting or exiting. Kernel time includes idle time.
+                if (GetSystemTimes(out FILETIME idleFt, out FILETIME kernelFt, out FILETIME userFt))
                 {
-                    // Skip inaccessible or exited process
-                }
-                finally
-                {
-                    proc.Dispose();
-                }
-            }
-
-            // Update System CPU % estimate
-            if (_lastCpuSampleTime != DateTime.MinValue && totalCpuSum > _lastTotalProcCpu)
-            {
-                double cpuTotalDelta = (totalCpuSum - _lastTotalProcCpu).TotalSeconds;
-                _cachedSystemCpuPercent = Math.Min(100.0, Math.Max(1.0, (cpuTotalDelta / (cpuDeltaSeconds * coreCount)) * 100.0));
-            }
-            _lastTotalProcCpu = totalCpuSum;
-            _lastCpuSampleTime = now;
-
-            // Group by Application Name
-            var grouped = individual
-                .GroupBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
-                .Select(g =>
-                {
-                    string appName = g.First().Name;
-                    double sumMb = g.Sum(x => x.MemoryMb);
-                    double peakMb = g.Max(x => x.PeakMemoryMb);
-                    double sumCpu = Math.Min(100.0, g.Sum(x => x.CpuPercent));
-                    bool isFg = g.Any(x => x.IsForeground);
-                    bool isProt = g.Any(x => x.IsProtected);
-                    bool isFrozen = _frozenApps.Contains(appName);
-                    bool isEco = _ecoApps.Contains(appName);
-                    int? capMb = (Config.AppMemoryCapsMb != null && Config.AppMemoryCapsMb.TryGetValue(appName, out int c)) ? c : null;
-
-                    double leakRate = UpdateAndCalculateLeakRate(appName, sumMb, now);
-                    bool isLeaking = leakRate >= Config.LeakVelocityThresholdMbMin && sumMb >= 200;
-
-                    int score = ComputeSmartScore(sumMb, sumCpu, leakRate, isFg, isProt);
-                    var (badge, color) = ResolveBadge(isFrozen, isEco, isFg, isProt, isLeaking, sumCpu, score);
-
-                    return new ProcessItem
+                    ulong idle = idleFt.Value, kernel = kernelFt.Value, user = userFt.Value;
+                    if (_lastSysKernel != 0)
                     {
-                        Name = appName,
-                        Pid = g.First().Pid,
-                        ProcessCount = g.Count(),
-                        MemoryMb = Math.Round(sumMb, 1),
-                        PeakMemoryMb = Math.Round(peakMb, 1),
-                        CpuPercent = Math.Round(sumCpu, 1),
-                        LeakRateMbPerMin = Math.Round(leakRate, 1),
-                        IsLeaking = isLeaking,
-                        IsForeground = isFg,
-                        IsProtected = isProt,
-                        IsFrozen = isFrozen,
-                        IsEco = isEco,
-                        CapMb = capMb,
-                        SmartScore = score,
-                        ReclaimableMb = isProt ? 0.0 : Math.Round(sumMb * (isFg ? 0.15 : 0.44), 1),
-                        StatusBadge = badge,
-                        StatusColorHex = color
-                    };
-                })
-                .OrderByDescending(x => x.MemoryMb)
-                .Take(65)
-                .ToList();
-
-            var topIndividual = individual
-                .OrderByDescending(x => x.MemoryMb)
-                .Take(65)
-                .ToList();
-
-            // Check Auto-Detected Workload Profiles
-            if (Config.ProfilesAutoSwitch)
-            {
-                WorkloadProfile? matched = null;
-                foreach (var prof in Config.Profiles.Where(p => p.Enabled && p.MatchExes.Count > 0))
+                        double total = (double)(kernel - _lastSysKernel) + (user - _lastSysUser);
+                        double idleDelta = idle - _lastSysIdle;
+                        if (total > 0)
+                            _cachedSystemCpuPercent = Math.Clamp((1.0 - idleDelta / total) * 100.0, 0.0, 100.0);
+                    }
+                    _lastSysIdle = idle;
+                    _lastSysKernel = kernel;
+                    _lastSysUser = user;
+                }
+                else if (_lastCpuSampleTime != DateTime.MinValue && totalCpuSum > _lastTotalProcCpu)
                 {
-                    if (prof.MatchExes.Any(exe => runningExeNames.Contains(exe)))
+                    double cpuTotalDelta = (totalCpuSum - _lastTotalProcCpu).TotalSeconds;
+                    _cachedSystemCpuPercent = Math.Min(100.0, Math.Max(1.0, (cpuTotalDelta / (cpuDeltaSeconds * coreCount)) * 100.0));
+                }
+                _lastTotalProcCpu = totalCpuSum;
+                _lastCpuSampleTime = now;
+                _lastPidCpu = pidCpu;
+
+                // Drop per-PID / per-app history for processes that have exited (prevents unbounded growth).
+                foreach (var stalePid in _procCpuSamples.Keys.Where(k => !seenPids.Contains(k)).ToList())
+                    _procCpuSamples.Remove(stalePid);
+                foreach (var staleApp in _appHistory.Keys.Where(k => !runningExeNames.Contains(k)).ToList())
+                    _appHistory.Remove(staleApp);
+
+                // Group by application name
+                var grouped = individual
+                    .GroupBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+                    .Select(g =>
                     {
-                        matched = prof;
-                        if (prof.AutoShieldMatched)
+                        string appName = g.First().Name;
+                        double sumMb = g.Sum(x => x.MemoryMb);
+                        double sumPriv = g.Sum(x => x.PrivateMb);
+                        double peakMb = g.Max(x => x.PeakMemoryMb);
+                        double sumCpu = Math.Min(100.0, g.Sum(x => x.CpuPercent));
+                        bool isFg = g.Any(x => x.IsForeground);
+                        bool isProt = g.Any(x => x.IsProtected);
+                        bool isFrozen = frozen.Contains(appName);
+                        bool isEco = eco.Contains(appName);
+                        int? capMb = caps.TryGetValue(appName, out int c) ? c : null;
+
+                        double leakRate = UpdateAndCalculateLeakRate(appName, sumPriv, now);
+                        bool isLeaking = leakRate >= Config.LeakVelocityThresholdMbMin && sumPriv >= 200;
+
+                        int score = ComputeSmartScore(sumMb, sumCpu, leakRate, isFg, isProt);
+                        var (badge, color) = ResolveBadge(isFrozen, isEco, isFg, isProt, isLeaking, sumCpu, score);
+
+                        return new ProcessItem
                         {
-                            foreach (var exe in prof.MatchExes.Where(e => runningExeNames.Contains(e)))
-                            {
-                                if (!Config.ProtectedApps.Contains(exe, StringComparer.OrdinalIgnoreCase))
-                                    Config.ProtectedApps.Add(exe);
-                            }
-                        }
-                        break;
-                    }
-                }
+                            Name = appName,
+                            Pid = g.First().Pid,
+                            ProcessCount = g.Count(),
+                            MemoryMb = Math.Round(sumMb, 1),
+                            PrivateMb = Math.Round(sumPriv, 1),
+                            PeakMemoryMb = Math.Round(peakMb, 1),
+                            CpuPercent = Math.Round(sumCpu, 1),
+                            LeakRateMbPerMin = Math.Round(leakRate, 1),
+                            IsLeaking = isLeaking,
+                            IsForeground = isFg,
+                            IsProtected = isProt,
+                            IsFrozen = isFrozen,
+                            IsEco = isEco,
+                            CapMb = capMb,
+                            SmartScore = score,
+                            ReclaimableMb = (isProt || (isFg && protectFg)) ? 0.0 : Math.Round(sumMb, 1),
+                            StatusBadge = badge,
+                            StatusColorHex = color
+                        };
+                    })
+                    .OrderByDescending(x => x.MemoryMb)
+                    .Take(65)
+                    .ToList();
 
-                if (matched != null && matched.BoostOnLaunch && _lastLaunchedProfileId != matched.Id)
+                var topIndividual = individual
+                    .OrderByDescending(x => x.MemoryMb)
+                    .Take(65)
+                    .ToList();
+
+                // Auto-detected workload profiles. Shields for matched EXEs live only while the profile is
+                // active; they are never written into the user's ProtectedApps list.
+                if (Config.ProfilesAutoSwitch)
                 {
-                    _lastLaunchedProfileId = matched.Id;
-                    ThreadPool.QueueUserWorkItem(_ =>
+                    WorkloadProfile? matched = null;
+                    var shields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var prof in Config.Profiles.Where(p => p.Enabled && p.MatchExes.Count > 0))
                     {
-                        OptimizeMemory(matched.AutoMode, "Profile Launch Boost", $"Auto-activated '{matched.Name}' profile");
-                    });
+                        if (prof.MatchExes.Any(exe => runningExeNames.Contains(exe)))
+                        {
+                            matched = prof;
+                            if (prof.AutoShieldMatched)
+                            {
+                                foreach (var exe in prof.MatchExes.Where(e => runningExeNames.Contains(e)))
+                                    shields.Add(exe);
+                            }
+                            break;
+                        }
+                    }
+
+                    lock (_stateLock)
+                    {
+                        _profileShields = shields;
+                    }
+
+                    if (matched != null && matched.BoostOnLaunch && _lastLaunchedProfileId != matched.Id)
+                    {
+                        _lastLaunchedProfileId = matched.Id;
+                        _lastAutoOptimizeTime = DateTime.Now;
+                        var launchProfile = matched;
+                        ThreadPool.QueueUserWorkItem(_ =>
+                        {
+                            if (!_disposed)
+                                OptimizeMemory(launchProfile.AutoMode, "Profile Launch Boost", $"Auto-activated '{launchProfile.Name}' profile");
+                        });
+                    }
+                    else if (matched == null)
+                    {
+                        _lastLaunchedProfileId = "";
+                    }
+
+                    _activeMatchedProfile = matched;
                 }
-                else if (matched == null)
+                else
                 {
-                    _lastLaunchedProfileId = "";
+                    lock (_stateLock)
+                    {
+                        _profileShields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    }
+                    _activeMatchedProfile = null;
                 }
 
-                _activeMatchedProfile = matched;
-            }
-
-            lock (_lock)
-            {
-                _cachedGroupedProcesses = grouped;
-                _cachedIndividualProcesses = topIndividual;
-            }
+                lock (_lock)
+                {
+                    _cachedGroupedProcesses = grouped;
+                    _cachedIndividualProcesses = topIndividual;
+                }
             }
             finally
             {
@@ -975,7 +1618,11 @@ namespace PulseRAM
             }
         }
 
-        private double UpdateAndCalculateLeakRate(string appName, double currentMb, DateTime now)
+        /// <summary>
+        /// Sustained private-memory growth in MB/min over a rolling 2-minute window. Requires most
+        /// samples to be rising so one-off allocations (opening a file, loading a level) don't count.
+        /// </summary>
+        private double UpdateAndCalculateLeakRate(string appName, double privateMb, DateTime now)
         {
             if (!_appHistory.TryGetValue(appName, out var list))
             {
@@ -983,16 +1630,25 @@ namespace PulseRAM
                 _appHistory[appName] = list;
             }
 
-            list.Add((now, currentMb));
-            list.RemoveAll(x => (now - x.Time).TotalSeconds > 90);
+            list.Add((now, privateMb));
+            list.RemoveAll(x => (now - x.Time).TotalSeconds > 120);
 
-            if (list.Count < 4) return 0.0;
+            if (list.Count < 6) return 0.0;
             var oldest = list[0];
             double dtMin = (now - oldest.Time).TotalMinutes;
-            if (dtMin < 0.2) return 0.0;
+            if (dtMin < 0.5) return 0.0;
 
-            double deltaMb = currentMb - oldest.MemMb;
-            return deltaMb > 5.0 ? (deltaMb / dtMin) : 0.0;
+            double deltaMb = privateMb - oldest.PrivateMb;
+            if (deltaMb <= 20.0) return 0.0;
+
+            int rising = 0;
+            for (int i = 1; i < list.Count; i++)
+            {
+                if (list[i].PrivateMb >= list[i - 1].PrivateMb - 1.0) rising++;
+            }
+            if (rising < (list.Count - 1) * 0.8) return 0.0;
+
+            return deltaMb / dtMin;
         }
 
         private static int ComputeSmartScore(double memMb, double cpuPct, double leakRate, bool isFg, bool isProt)
@@ -1017,134 +1673,180 @@ namespace PulseRAM
             return ("BACKGROUND", "#94A3B8");
         }
 
-        #region Core Kernel Memory Optimization Operations
+        #endregion
 
+        #region Core Memory Optimization Operations
+
+        /// <summary>
+        /// Modes:
+        ///  smart   — trims idle (low-CPU) background processes above MinProcessWorkingSetMb.
+        ///  deep    — trims every eligible process; with admin also combines pages, flushes the modified list
+        ///            and purges the LOW-priority standby list.
+        ///  standby — admin only: flushes the modified list and purges the whole standby list.
+        ///  max     — deep trim + page combine + modified flush + full standby purge (admin for the kernel part).
+        /// Shielded, critical and (optionally) foreground processes are never trimmed in any mode.
+        /// </summary>
         public OptimizationEvent OptimizeMemory(string mode = "smart", string trigger = "Manual", string reason = "Manual optimization")
         {
+            lock (_optimizeLock)
+            {
+                return OptimizeMemoryCore(mode, trigger, reason);
+            }
+        }
+
+        private OptimizationEvent OptimizeMemoryCore(string mode, string trigger, string reason)
+        {
             var sw = Stopwatch.StartNew();
-            var beforeSnap = SampleTelemetryAndProcesses(forceProcessScan: false);
+            var beforeSnap = SampleTelemetryAndProcesses(forceProcessScan: false, recordTelemetry: false);
             var fg = GetForegroundProcessInfo();
 
+            string normMode = (mode ?? "smart").ToLowerInvariant();
+            if (!IsKnownMode(normMode)) normMode = "smart";
+            bool wantsKernel = normMode is "deep" or "standby" or "max";
+
+            if (normMode == "standby" && !_privilegesEnabled)
+            {
+                return RecordEvent(new OptimizationEvent
+                {
+                    Mode = "STANDBY",
+                    Trigger = trigger,
+                    Reason = reason,
+                    BeforePercent = beforeSnap.Percent,
+                    AfterPercent = beforeSnap.Percent,
+                    DurationMs = sw.ElapsedMilliseconds,
+                    Skipped = true,
+                    Note = "Standby purge needs administrator rights — nothing was changed."
+                }, countAsOptimization: false, trigger);
+            }
+
             int trimmedCount = 0;
+            double trimmedMb = 0.0;
             bool standbyPurged = false;
             bool modifiedFlushed = false;
             bool pagesCombined = false;
 
-            string normMode = (mode ?? "smart").ToLowerInvariant();
-
-            if (normMode == "smart" || normMode == "deep" || normMode == "max")
+            if (normMode is "smart" or "deep" or "max")
             {
-                var procs = Process.GetProcesses();
-                foreach (var proc in procs)
+                // Smart mode needs per-process CPU deltas (two scans). Right after launch only the baseline
+                // scan exists, so take the second one now instead of trimming nothing.
+                if (normMode == "smart" && _lastPidCpu.Count == 0)
+                    RefreshProcessSnapshots(fg.Name, waitForLock: true);
+                var pidCpu = _lastPidCpu;
+                double minWs = Config.MinProcessWorkingSetMb;
+                double idleCeiling = Config.IdleCpuCeilingPercent;
+                bool protectFg = Config.ProtectForeground;
+
+                foreach (var proc in Process.GetProcesses())
                 {
                     try
                     {
                         if (proc.Id <= 4) continue;
-                        string name = proc.ProcessName;
-                        if (!name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                            name += ".exe";
+                        string name = ExeName(proc.ProcessName);
 
-                        if (CriticalSystemProcesses.Contains(name))
+                        if (IsShielded(name))
                             continue;
-                        if (Config.ProtectedApps.Contains(name, StringComparer.OrdinalIgnoreCase))
-                            continue;
-                        if (Config.ProtectForeground && string.Equals(name, fg.Name, StringComparison.OrdinalIgnoreCase))
+                        if (protectFg && string.Equals(name, fg.Name, StringComparison.OrdinalIgnoreCase))
                             continue;
 
-                        double mb = proc.WorkingSet64 / (1024.0 * 1024.0);
-                        if (normMode == "smart" && mb < 25.0)
-                            continue;
-
-                        IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA, false, proc.Id);
-                        if (hProc != IntPtr.Zero)
+                        long wsBefore = proc.WorkingSet64;
+                        if (normMode == "smart")
                         {
-                            try
-                            {
-                                if (EmptyWorkingSet(hProc))
-                                {
-                                    trimmedCount++;
-                                }
-                                else if (SetProcessWorkingSetSizeEx(hProc, new IntPtr(-1), new IntPtr(-1), 0))
-                                {
-                                    trimmedCount++;
-                                }
-                            }
-                            finally
-                            {
-                                CloseHandle(hProc);
-                            }
+                            if (wsBefore / (1024.0 * 1024.0) < minWs)
+                                continue;
+                            // "Idle only": skip processes we have no CPU sample for, or that are busy.
+                            if (!pidCpu.TryGetValue(proc.Id, out double cpu) || cpu > idleCeiling)
+                                continue;
                         }
+
+                        IntPtr hProc = OpenProcess(TRIM_ACCESS, false, proc.Id);
+                        if (hProc == IntPtr.Zero) continue;
+                        try
+                        {
+                            bool ok = EmptyWorkingSet(hProc)
+                                || SetProcessWorkingSetSizeEx(hProc, new IntPtr(-1), new IntPtr(-1), 0);
+                            if (!ok) continue;
+                        }
+                        finally
+                        {
+                            CloseHandle(hProc);
+                        }
+
+                        trimmedCount++;
+                        proc.Refresh();
+                        trimmedMb += Math.Max(0, wsBefore - proc.WorkingSet64) / (1024.0 * 1024.0);
                     }
                     catch
                     {
-                        // Ignore protected process
+                        // Ignore protected / exited process
                     }
                     finally
                     {
                         proc.Dispose();
                     }
                 }
+                // Note: the system-wide MemoryEmptyWorkingSets command is deliberately NOT used in "max":
+                // it would also trim shielded, critical and foreground processes.
             }
 
-            // Execute Kernel SystemMemoryList commands when privileged
-            if (_privilegesEnabled && (normMode == "deep" || normMode == "standby" || normMode == "max"))
+            if (wantsKernel && _privilegesEnabled)
             {
-                if (normMode == "max")
-                {
-                    int cmdEmpty = MemoryEmptyWorkingSets;
-                    NtSetSystemInformation(SystemMemoryListInformation, ref cmdEmpty, sizeof(int));
-                }
-
-                if (normMode == "deep" || normMode == "max")
+                if (normMode is "deep" or "max")
                 {
                     var combineInfo = new MEMORY_COMBINE_INFORMATION_EX();
                     if (NtSetSystemInformation(SystemCombinePhysicalMemoryInformation, ref combineInfo, Marshal.SizeOf<MEMORY_COMBINE_INFORMATION_EX>()) == 0)
-                    {
                         pagesCombined = true;
-                    }
                 }
 
                 int cmdFlush = MemoryFlushModifiedList;
                 if (NtSetSystemInformation(SystemMemoryListInformation, ref cmdFlush, sizeof(int)) == 0)
-                {
                     modifiedFlushed = true;
-                }
 
                 int cmdStandby = normMode == "deep" ? MemoryPurgeLowPriorityStandbyList : MemoryPurgeStandbyList;
                 if (NtSetSystemInformation(SystemMemoryListInformation, ref cmdStandby, sizeof(int)) == 0)
-                {
                     standbyPurged = true;
-                }
             }
 
-            Thread.Sleep(120);
-            var afterSnap = SampleTelemetryAndProcesses(forceProcessScan: true);
+            Thread.Sleep(150);
+            var afterSnap = SampleTelemetryAndProcesses(forceProcessScan: true, recordTelemetry: false);
             sw.Stop();
 
-            double rawFreedMb = Math.Max(0.0, ( afterSnap.AvailableGb - beforeSnap.AvailableGb ) * 1024.0);
-            if (rawFreedMb < 12.0 && trimmedCount > 0)
-            {
-                rawFreedMb = Math.Round(trimmedCount * 4.2, 1);
-            }
+            double availGainMb = Math.Max(0.0, (afterSnap.AvailableGb - beforeSnap.AvailableGb) * 1024.0);
+            double freeGainMb = (beforeSnap.MemoryListsMeasured && afterSnap.MemoryListsMeasured)
+                ? Math.Max(0.0, (afterSnap.FreeExactGb - beforeSnap.FreeExactGb) * 1024.0)
+                : 0.0;
 
-            _sessionFreedMb += rawFreedMb;
-            _optimizationCount++;
+            string note = "";
+            if (wantsKernel && !_privilegesEnabled)
+                note = "Kernel purge skipped — run PulseRAM as administrator to purge the standby list.";
 
-            var ev = new OptimizationEvent
+            return RecordEvent(new OptimizationEvent
             {
-                Timestamp = DateTime.Now.ToString("HH:mm:ss"),
                 Mode = normMode.ToUpperInvariant(),
                 Trigger = trigger,
                 Reason = reason,
-                FreedMb = Math.Round(rawFreedMb, 1),
+                // Pure standby purge trims nothing; its measurable effect is pages moved to the free list.
+                FreedMb = Math.Round(normMode == "standby" ? freeGainMb : trimmedMb, 1),
+                AvailableGainMb = Math.Round(availGainMb, 1),
+                FreeListGainMb = Math.Round(freeGainMb, 1),
                 BeforePercent = beforeSnap.Percent,
                 AfterPercent = afterSnap.Percent,
                 ProcessesTrimmed = trimmedCount,
                 DurationMs = sw.ElapsedMilliseconds,
                 StandbyPurged = standbyPurged,
                 ModifiedFlushed = modifiedFlushed,
-                PagesCombined = pagesCombined
-            };
+                PagesCombined = pagesCombined,
+                Note = note
+            }, countAsOptimization: true, trigger);
+        }
+
+        private OptimizationEvent RecordEvent(OptimizationEvent ev, bool countAsOptimization, string trigger)
+        {
+            if (countAsOptimization)
+            {
+                // The session counter is "working set trimmed"; a pure standby purge trims nothing.
+                if (ev.Mode != "STANDBY") _sessionFreedMb += ev.FreedMb;
+                _optimizationCount++;
+            }
 
             lock (_lock)
             {
@@ -1153,92 +1855,166 @@ namespace PulseRAM
                     _events.RemoveAt(_events.Count - 1);
             }
 
-            if (Config.AutoSoundChime && trigger != "Manual")
+            if (countAsOptimization && Config.AutoSoundChime && trigger != "Manual")
             {
                 try { MessageBeep(0x40); } catch { }
             }
+
+            // Refresh the cached snapshot's session counters for the UI.
+            var s = _lastSnapshot;
+            s.SessionFreedMb = Math.Round(_sessionFreedMb, 1);
+            s.OptimizationCount = _optimizationCount;
 
             OnOptimizationCompleted?.Invoke(ev);
             return ev;
         }
 
-        public OptimizationEvent OptimizeSingleApp(string appName, string reason = "Single App Trim", int? hardCapMb = null)
+        /// <summary>
+        /// Applies a HARD per-process working-set maximum (QUOTA_LIMITS_HARDWS_MAX_ENABLE) to every process of
+        /// an app. With <paramref name="force"/> false, only processes that don't already carry the cap are
+        /// touched, so repeated checks cost nothing and never re-trim capped processes.
+        /// Returns the number of processes the cap was applied to.
+        /// </summary>
+        private int EnforceHardCap(string appName, int capMb, bool force)
         {
-            var sw = Stopwatch.StartNew();
-            var beforeSnap = SampleTelemetryAndProcesses(forceProcessScan: false);
-            int trimmedCount = 0;
-            double beforeAppMb = 0;
-            double afterAppMb = 0;
-
-            string baseProcName = appName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
-                ? appName.Substring(0, appName.Length - 4)
-                : appName;
-
-            var procs = Process.GetProcessesByName(baseProcName);
-            foreach (var proc in procs)
+            lock (_optimizeLock)
             {
-                try
+                var sw = Stopwatch.StartNew();
+                long capBytes = capMb * 1024L * 1024L;
+                int applied = 0;
+                int refused = 0;
+                double trimmedMb = 0;
+                double beforePct = _lastSnapshot.Percent;
+
+                foreach (var proc in Process.GetProcessesByName(BaseName(appName)))
                 {
-                    beforeAppMb += proc.WorkingSet64 / (1024.0 * 1024.0);
-                    IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA, false, proc.Id);
-                    if (hProc != IntPtr.Zero)
+                    try
                     {
+                        IntPtr h = OpenProcess(TRIM_ACCESS, false, proc.Id);
+                        if (h == IntPtr.Zero) { refused++; continue; }
                         try
                         {
-                            if (hardCapMb.HasValue && hardCapMb.Value >= 64)
+                            bool needs = force;
+                            if (!needs)
                             {
-                                IntPtr maxBytes = new IntPtr(hardCapMb.Value * 1024L * 1024L);
-                                SetProcessWorkingSetSizeEx(hProc, new IntPtr(1024 * 1024), maxBytes, 0);
+                                needs = !GetProcessWorkingSetSizeEx(h, out _, out IntPtr curMax, out uint flags)
+                                    || (flags & QUOTA_LIMITS_HARDWS_MAX_ENABLE) == 0
+                                    || curMax.ToInt64() != capBytes;
                             }
-                            if (EmptyWorkingSet(hProc))
+                            if (!needs) continue;
+
+                            long wsBefore = proc.WorkingSet64;
+                            if (SetProcessWorkingSetSizeEx(h, new IntPtr(1024 * 1024), new IntPtr(capBytes),
+                                    QUOTA_LIMITS_HARDWS_MAX_ENABLE | QUOTA_LIMITS_HARDWS_MIN_DISABLE))
                             {
-                                trimmedCount++;
+                                applied++;
+                                proc.Refresh();
+                                trimmedMb += Math.Max(0, wsBefore - proc.WorkingSet64) / (1024.0 * 1024.0);
                             }
+                            else
+                            {
+                                refused++;
+                            }
+                        }
+                        finally
+                        {
+                            CloseHandle(h);
+                        }
+                    }
+                    catch { }
+                    finally { proc.Dispose(); }
+                }
+
+                if (applied > 0 || (force && refused > 0))
+                {
+                    sw.Stop();
+                    RecordEvent(new OptimizationEvent
+                    {
+                        Mode = "APP CAP",
+                        Trigger = "Targeted",
+                        Reason = $"{appName}: {capMb} MB hard working-set cap per process",
+                        FreedMb = Math.Round(trimmedMb, 1),
+                        BeforePercent = beforePct,
+                        AfterPercent = _lastSnapshot.Percent,
+                        ProcessesTrimmed = applied,
+                        DurationMs = sw.ElapsedMilliseconds,
+                        Skipped = applied == 0,
+                        Note = refused > 0 ? $"{refused} process(es) refused the cap (access denied)." : ""
+                    }, countAsOptimization: applied > 0, "Targeted");
+                }
+                return applied;
+            }
+        }
+
+        /// <summary>Trims one application's processes (working-set trim only).</summary>
+        public OptimizationEvent OptimizeSingleApp(string appName, string reason = "Single App Trim")
+        {
+            lock (_optimizeLock)
+            {
+                var sw = Stopwatch.StartNew();
+                var beforeSnap = SampleTelemetryAndProcesses(forceProcessScan: false, recordTelemetry: false);
+
+                if (IsCritical(appName))
+                {
+                    return RecordEvent(new OptimizationEvent
+                    {
+                        Mode = "APP TRIM",
+                        Trigger = "Targeted",
+                        Reason = $"{appName}: {reason}",
+                        BeforePercent = beforeSnap.Percent,
+                        AfterPercent = beforeSnap.Percent,
+                        Skipped = true,
+                        Note = $"{appName} is a critical system process and is never trimmed."
+                    }, countAsOptimization: false, "Targeted");
+                }
+
+                int trimmedCount = 0;
+                double trimmedMb = 0;
+
+                foreach (var proc in Process.GetProcessesByName(BaseName(appName)))
+                {
+                    try
+                    {
+                        long wsBefore = proc.WorkingSet64;
+                        IntPtr hProc = OpenProcess(TRIM_ACCESS, false, proc.Id);
+                        if (hProc == IntPtr.Zero) continue;
+                        bool ok;
+                        try
+                        {
+                            ok = EmptyWorkingSet(hProc);
                         }
                         finally
                         {
                             CloseHandle(hProc);
                         }
+                        if (!ok) continue;
+
+                        trimmedCount++;
+                        proc.Refresh();
+                        trimmedMb += Math.Max(0, wsBefore - proc.WorkingSet64) / (1024.0 * 1024.0);
                     }
-                    proc.Refresh();
-                    afterAppMb += proc.WorkingSet64 / (1024.0 * 1024.0);
+                    catch { }
+                    finally { proc.Dispose(); }
                 }
-                catch { }
-                finally { proc.Dispose(); }
+
+                var afterSnap = SampleTelemetryAndProcesses(forceProcessScan: true, recordTelemetry: false);
+                sw.Stop();
+
+                return RecordEvent(new OptimizationEvent
+                {
+                    Mode = "APP TRIM",
+                    Trigger = "Targeted",
+                    Reason = $"{appName}: {reason}",
+                    FreedMb = Math.Round(trimmedMb, 1),
+                    AvailableGainMb = Math.Round(Math.Max(0.0, (afterSnap.AvailableGb - beforeSnap.AvailableGb) * 1024.0), 1),
+                    BeforePercent = beforeSnap.Percent,
+                    AfterPercent = afterSnap.Percent,
+                    ProcessesTrimmed = trimmedCount,
+                    DurationMs = sw.ElapsedMilliseconds,
+                    Skipped = trimmedCount == 0,
+                    Note = trimmedCount == 0 ? "No process could be trimmed (not running or access denied)." : ""
+                }, countAsOptimization: trimmedCount > 0, "Targeted");
             }
-
-            var afterSnap = SampleTelemetryAndProcesses(forceProcessScan: true);
-            sw.Stop();
-
-            double freedMb = Math.Max(0.0, beforeAppMb - afterAppMb);
-            if (freedMb < 1.0 && trimmedCount > 0)
-                freedMb = Math.Max(2.0, (afterSnap.AvailableGb - beforeSnap.AvailableGb) * 1024.0);
-
-            _sessionFreedMb += freedMb;
-            _optimizationCount++;
-
-            var ev = new OptimizationEvent
-            {
-                Timestamp = DateTime.Now.ToString("HH:mm:ss"),
-                Mode = "APP TRIM",
-                Trigger = "Targeted",
-                Reason = $"{appName}: {reason}",
-                FreedMb = Math.Round(freedMb, 1),
-                BeforePercent = beforeSnap.Percent,
-                AfterPercent = afterSnap.Percent,
-                ProcessesTrimmed = trimmedCount,
-                DurationMs = sw.ElapsedMilliseconds
-            };
-
-            lock (_lock)
-            {
-                _events.Insert(0, ev);
-                while (_events.Count > 40)
-                    _events.RemoveAt(_events.Count - 1);
-            }
-
-            OnOptimizationCompleted?.Invoke(ev);
-            return ev;
         }
 
         #endregion
@@ -1247,57 +2023,111 @@ namespace PulseRAM
 
         public bool ToggleProtectApp(string appName)
         {
-            var existing = Config.ProtectedApps.FirstOrDefault(x => string.Equals(x, appName, StringComparison.OrdinalIgnoreCase));
             bool nowProtected;
-            if (existing != null)
+            lock (_stateLock)
             {
-                Config.ProtectedApps.Remove(existing);
-                nowProtected = false;
-            }
-            else
-            {
-                Config.ProtectedApps.Add(appName);
-                nowProtected = true;
+                var existing = Config.ProtectedApps.FirstOrDefault(x => string.Equals(x, appName, StringComparison.OrdinalIgnoreCase));
+                if (existing != null)
+                {
+                    Config.ProtectedApps.Remove(existing);
+                    nowProtected = false;
+                }
+                else
+                {
+                    Config.ProtectedApps.Add(appName);
+                    nowProtected = true;
+                }
             }
             SaveConfig();
-            RefreshProcessSnapshots(GetForegroundProcessInfo().Name);
+            RequestRescan();
             return nowProtected;
         }
 
+        private enum ResumeResult { Resumed, Gone, Failed }
+
+        /// <summary>Resumes exactly the journaled PID (verified by name and start time).</summary>
+        private static ResumeResult TryResumeRecord(FrozenRecord rec)
+        {
+            Process? proc = null;
+            try
+            {
+                try { proc = Process.GetProcessById(rec.Pid); }
+                catch (ArgumentException) { return ResumeResult.Gone; }
+
+                if (!string.Equals(ExeName(proc.ProcessName), ExeName(rec.Name), StringComparison.OrdinalIgnoreCase))
+                    return ResumeResult.Gone; // PID reused by another program
+                if (rec.StartTicksUtc != 0 && TryGetStartTicks(proc) is long t && t != 0 && t != rec.StartTicksUtc)
+                    return ResumeResult.Gone; // PID reused by a newer instance
+
+                IntPtr h = OpenProcess(PROCESS_SUSPEND_RESUME, false, rec.Pid);
+                if (h == IntPtr.Zero) return ResumeResult.Failed;
+                try
+                {
+                    return NtResumeProcess(h) == 0 ? ResumeResult.Resumed : ResumeResult.Failed;
+                }
+                finally
+                {
+                    CloseHandle(h);
+                }
+            }
+            catch
+            {
+                return ResumeResult.Failed;
+            }
+            finally
+            {
+                proc?.Dispose();
+            }
+        }
+
+        private static bool SameApp(FrozenRecord r, string appName) =>
+            string.Equals(BaseName(r.Name), BaseName(appName), StringComparison.OrdinalIgnoreCase);
+
         public (bool Ok, bool Frozen, string Message) ToggleFreezeApp(string appName)
         {
-            if (UnfreezableProcesses.Contains(appName))
+            // One freeze/thaw at a time: two overlapping freezes would suspend a process twice, and a single
+            // thaw would then leave it suspended.
+            lock (_freezeLock)
+            {
+                if (_disposed) return (false, false, "PulseRAM is shutting down.");
+                return ToggleFreezeCore(appName);
+            }
+        }
+
+        private (bool Ok, bool Frozen, string Message) ToggleFreezeCore(string appName)
+        {
+            if (IsUnfreezable(appName))
             {
                 return (false, false, $"{appName} is a critical system process and cannot be frozen.");
             }
 
-            bool targetFreeze = !_frozenApps.Contains(appName);
-            string baseName = appName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
-                ? appName.Substring(0, appName.Length - 4)
-                : appName;
-
-            int affected = 0;
-            foreach (var proc in Process.GetProcessesByName(baseName))
+            bool targetFreeze;
+            List<FrozenRecord> existing;
+            lock (_stateLock)
             {
-                try
+                targetFreeze = !_frozenApps.Contains(appName);
+                existing = _frozenRecords.Where(r => SameApp(r, appName)).ToList();
+            }
+
+            if (targetFreeze)
+            {
+                int affected = 0;
+                int trimmed = 0;
+                var newRecords = new List<FrozenRecord>();
+                foreach (var proc in Process.GetProcessesByName(BaseName(appName)))
                 {
-                    IntPtr hProc = OpenProcess(PROCESS_SUSPEND_RESUME | PROCESS_SET_QUOTA, false, proc.Id);
-                    if (hProc != IntPtr.Zero)
+                    try
                     {
+                        // QUERY_LIMITED is required for EmptyWorkingSet; without it the trim silently fails.
+                        IntPtr hProc = OpenProcess(PROCESS_SUSPEND_RESUME | TRIM_ACCESS, false, proc.Id);
+                        if (hProc == IntPtr.Zero) continue;
                         try
                         {
-                            if (targetFreeze)
+                            if (NtSuspendProcess(hProc) == 0)
                             {
-                                if (NtSuspendProcess(hProc) == 0)
-                                {
-                                    EmptyWorkingSet(hProc);
-                                    affected++;
-                                }
-                            }
-                            else
-                            {
-                                if (NtResumeProcess(hProc) == 0)
-                                    affected++;
+                                affected++;
+                                newRecords.Add(new FrozenRecord { Name = ExeName(appName), Pid = proc.Id, StartTicksUtc = TryGetStartTicks(proc) });
+                                if (EmptyWorkingSet(hProc)) trimmed++;
                             }
                         }
                         finally
@@ -1305,80 +2135,127 @@ namespace PulseRAM
                             CloseHandle(hProc);
                         }
                     }
+                    catch { }
+                    finally { proc.Dispose(); }
                 }
-                catch { }
-                finally { proc.Dispose(); }
+
+                if (affected == 0)
+                    return (false, false, $"Could not suspend {appName} (not running or access denied).");
+
+                lock (_stateLock)
+                {
+                    _frozenApps.Add(appName);
+                    _frozenRecords.AddRange(newRecords);
+                    // Journal every frozen PID so a crash, kill or uninstall can never leave apps suspended.
+                    WriteFrozenJournal(_frozenRecords.ToList());
+                }
+                RequestRescan();
+                return (true, true, $"Froze {appName}: {affected} process(es) suspended, {trimmed} trimmed");
             }
 
-            if (targetFreeze) _frozenApps.Add(appName);
-            else _frozenApps.Remove(appName);
+            // Thaw: resume exactly the PIDs we suspended. Keep the records we could not resume (access denied)
+            // so they are retried later instead of being forgotten.
+            int resumed = 0;
+            var keep = new List<FrozenRecord>();
+            foreach (var rec in existing)
+            {
+                switch (TryResumeRecord(rec))
+                {
+                    case ResumeResult.Resumed: resumed++; break;
+                    case ResumeResult.Failed: keep.Add(rec); break;
+                    case ResumeResult.Gone: break;
+                }
+            }
 
-            RefreshProcessSnapshots(GetForegroundProcessInfo().Name);
-            return (true, targetFreeze, targetFreeze
-                ? $"Cryo-Froze {appName} ({affected} PIDs suspended + RAM trimmed)"
-                : $"Thawed {appName} ({affected} PIDs resumed)");
+            lock (_stateLock)
+            {
+                _frozenRecords.RemoveAll(r => SameApp(r, appName));
+                _frozenRecords.AddRange(keep);
+                if (keep.Count == 0) _frozenApps.Remove(appName);
+                WriteFrozenJournal(_frozenRecords.ToList());
+            }
+            RequestRescan();
+
+            if (keep.Count > 0)
+                return (false, true, $"Resumed {resumed}, but {keep.Count} process(es) of {appName} refused (run PulseRAM as administrator).");
+            return (true, false, $"Thawed {appName}: {resumed} process(es) resumed");
         }
 
         public int ThawAllApps()
         {
-            int count = 0;
-            foreach (var app in _frozenApps.ToList())
+            lock (_freezeLock)
             {
-                var res = ToggleFreezeApp(app);
-                if (res.Ok) count++;
+                List<string> apps;
+                lock (_stateLock)
+                {
+                    apps = _frozenApps.ToList();
+                }
+
+                int count = 0;
+                foreach (var app in apps)
+                {
+                    if (ToggleFreezeCore(app).Ok) count++;
+                }
+                // Records that refused to resume stay in _frozenRecords and the journal for a later retry.
+                return count;
             }
-            _frozenApps.Clear();
-            return count;
         }
 
         public (bool Ok, bool EcoActive, string Message) ToggleEcoApp(string appName)
         {
-            if (CriticalSystemProcesses.Contains(appName))
+            if (IsCritical(appName))
                 return (false, false, $"{appName} cannot be throttled.");
+            if (_disposed)
+                return (false, false, "PulseRAM is shutting down.");
 
-            bool enableEco = !_ecoApps.Contains(appName);
-            string baseName = appName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
-                ? appName.Substring(0, appName.Length - 4)
-                : appName;
+            bool enableEco;
+            lock (_stateLock)
+            {
+                enableEco = !_ecoApps.Contains(appName);
+            }
 
             int affected = 0;
-            foreach (var proc in Process.GetProcessesByName(baseName))
+            foreach (var proc in Process.GetProcessesByName(BaseName(appName)))
             {
                 try
                 {
-                    IntPtr hProc = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA, false, proc.Id);
-                    if (hProc != IntPtr.Zero)
+                    IntPtr hProc = OpenProcess(PROCESS_SET_INFORMATION | TRIM_ACCESS, false, proc.Id);
+                    if (hProc == IntPtr.Zero) continue;
+                    try
                     {
-                        try
+                        bool prioOk = SetPriorityClass(hProc, enableEco ? IDLE_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
+                        var state = new PROCESS_POWER_THROTTLING_STATE
                         {
-                            SetPriorityClass(hProc, enableEco ? IDLE_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
-                            var state = new PROCESS_POWER_THROTTLING_STATE
-                            {
-                                Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-                                ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-                                StateMask = enableEco ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0
-                            };
-                            SetProcessInformation(hProc, ProcessPowerThrottling, ref state, (uint)Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>());
-                            if (enableEco) EmptyWorkingSet(hProc);
-                            affected++;
-                        }
-                        finally
-                        {
-                            CloseHandle(hProc);
-                        }
+                            Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                            ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                            StateMask = enableEco ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0
+                        };
+                        bool qosOk = SetProcessInformation(hProc, ProcessPowerThrottling, ref state, (uint)Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>());
+                        if (enableEco) EmptyWorkingSet(hProc);
+                        if (prioOk || qosOk) affected++;
+                    }
+                    finally
+                    {
+                        CloseHandle(hProc);
                     }
                 }
                 catch { }
                 finally { proc.Dispose(); }
             }
 
-            if (enableEco) _ecoApps.Add(appName);
-            else _ecoApps.Remove(appName);
+            if (enableEco && affected == 0)
+                return (false, false, $"Could not throttle {appName} (not running or access denied).");
+
+            lock (_stateLock)
+            {
+                if (enableEco) _ecoApps.Add(appName);
+                else _ecoApps.Remove(appName);
+            }
 
             SaveConfig();
-            RefreshProcessSnapshots(GetForegroundProcessInfo().Name);
+            RequestRescan();
             return (true, enableEco, enableEco
-                ? $"Enabled Windows 11 EcoQoS Efficiency Mode on {appName} ({affected} PIDs)"
+                ? $"Enabled EcoQoS Efficiency Mode on {appName} ({affected} PIDs)"
                 : $"Restored normal priority on {appName}");
         }
 
@@ -1386,23 +2263,72 @@ namespace PulseRAM
         {
             if (capMb.HasValue && capMb.Value >= 64)
             {
-                Config.AppMemoryCapsMb[appName] = capMb.Value;
-                OptimizeSingleApp(appName, $"Applied {capMb.Value} MB Working-Set Ceiling", capMb.Value);
+                lock (_stateLock)
+                {
+                    Config.AppMemoryCapsMb[appName] = capMb.Value;
+                    _lastCapAction[appName] = DateTime.Now;
+                }
+                EnforceHardCap(appName, capMb.Value, force: true);
             }
             else
             {
-                Config.AppMemoryCapsMb.Remove(appName);
+                lock (_stateLock)
+                {
+                    Config.AppMemoryCapsMb.Remove(appName);
+                    _lastCapAction.Remove(appName);
+                }
+                ReleaseHardCap(appName);
             }
             SaveConfig();
-            RefreshProcessSnapshots(GetForegroundProcessInfo().Name);
+            RequestRescan();
+        }
+
+        /// <summary>Turns the hard working-set maximum back into the normal soft limit.</summary>
+        private static void ReleaseHardCap(string appName)
+        {
+            foreach (var proc in Process.GetProcessesByName(BaseName(appName)))
+            {
+                try
+                {
+                    IntPtr h = OpenProcess(TRIM_ACCESS, false, proc.Id);
+                    if (h == IntPtr.Zero) continue;
+                    try
+                    {
+                        if (GetProcessWorkingSetSizeEx(h, out IntPtr min, out IntPtr max, out _))
+                        {
+                            SetProcessWorkingSetSizeEx(h, min, max, QUOTA_LIMITS_HARDWS_MAX_DISABLE | QUOTA_LIMITS_HARDWS_MIN_DISABLE);
+                        }
+                    }
+                    finally
+                    {
+                        CloseHandle(h);
+                    }
+                }
+                catch { }
+                finally { proc.Dispose(); }
+            }
+        }
+
+        private void RequestRescan()
+        {
+            // Run the rescan off the caller's (UI) thread.
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    if (!_disposed) RefreshProcessSnapshots(GetForegroundProcessInfo().Name);
+                }
+                catch { }
+            });
         }
 
         #endregion
 
-        #region Windows Startup Registry Management
+        #region Windows Startup (HKCU Run key or elevated scheduled task)
 
         private const string StartupRegPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string StartupValueName = "PulseRAM";
+        public const string ElevatedStartupTaskName = "PulseRAM Elevated Startup";
 
         public bool CheckWindowsStartupRegistry()
         {
@@ -1417,30 +2343,127 @@ namespace PulseRAM
             }
         }
 
-        public bool SetWindowsStartupRegistry(bool enable)
+        public bool ElevatedStartupTaskExists() => RunSchtasks($"/Query /TN \"{ElevatedStartupTaskName}\"") == 0;
+
+        public bool IsStartupEnabled() => CheckWindowsStartupRegistry() || ElevatedStartupTaskExists();
+
+        /// <summary>Kept for compatibility: enables/disables startup and returns whether it succeeded.</summary>
+        public bool SetWindowsStartupRegistry(bool enable) => SetStartup(enable).Ok;
+
+        /// <summary>
+        /// Enables or disables launch at logon. When PulseRAM is running as administrator, startup uses an
+        /// elevated Task Scheduler task so kernel purges keep working after a reboot (a Run-key entry always
+        /// starts as a standard user). Otherwise it falls back to the per-user Run key.
+        /// </summary>
+        public (bool Ok, bool Elevated, string Message) SetStartup(bool enable)
         {
+            string exePath = Process.GetCurrentProcess().MainModule?.FileName
+                ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PulseRAM.exe");
+
             try
             {
-                using var key = Registry.CurrentUser.OpenSubKey(StartupRegPath, true);
-                if (key == null) return false;
                 if (enable)
                 {
-                    string exePath = Process.GetCurrentProcess().MainModule?.FileName
-                        ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PulseRAM.exe");
-                    key.SetValue(StartupValueName, $"\"{exePath}\" --tray");
+                    if (_isAdmin && CreateElevatedStartupTask(exePath))
+                    {
+                        // Remove the Run-key entry: a non-elevated copy launched by it could win the
+                        // single-instance race and the elevated one would exit.
+                        SetRunKey(false, exePath);
+                        Config.RunOnStartup = true;
+                        SaveConfig();
+                        return (true, true, "PulseRAM will start elevated in the tray at logon (Task Scheduler).");
+                    }
+
+                    SetRunKey(true, exePath);
                     Config.RunOnStartup = true;
+                    SaveConfig();
+                    return (true, false, _isAdmin
+                        ? "Registered in HKCU\\...\\Run (could not create the elevated task)."
+                        : "Starts at logon as a standard user. Run PulseRAM as administrator and re-enable to start elevated.");
                 }
                 else
                 {
-                    key.DeleteValue(StartupValueName, false);
-                    Config.RunOnStartup = false;
+                    SetRunKey(false, exePath);
+                    bool taskRemoved = true;
+                    if (ElevatedStartupTaskExists())
+                        taskRemoved = RunSchtasks($"/Delete /TN \"{ElevatedStartupTaskName}\" /F") == 0;
+
+                    Config.RunOnStartup = !taskRemoved;
+                    SaveConfig();
+                    return taskRemoved
+                        ? (true, false, "Removed PulseRAM from Windows startup.")
+                        : (false, true, "The elevated startup task can only be removed while PulseRAM runs as administrator.");
                 }
-                SaveConfig();
-                return true;
+            }
+            catch (Exception ex)
+            {
+                return (false, false, $"Could not change startup: {ex.Message}");
+            }
+        }
+
+        private static void SetRunKey(bool enable, string exePath)
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(StartupRegPath, true);
+            if (key == null) return;
+            if (enable) key.SetValue(StartupValueName, $"\"{exePath}\" --tray");
+            else key.DeleteValue(StartupValueName, false);
+        }
+
+        private static bool CreateElevatedStartupTask(string exePath)
+        {
+            string user;
+            using (var id = WindowsIdentity.GetCurrent()) user = id.Name;
+
+            // XML (rather than schtasks flags) so the task also starts on battery power and never times out.
+            string xml =
+$@"<?xml version=""1.0"" encoding=""UTF-16""?>
+<Task version=""1.2"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
+  <RegistrationInfo><Description>Starts PulseRAM elevated in the system tray at logon.</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{SecurityElement.Escape(user)}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id=""Author""><UserId>{SecurityElement.Escape(user)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context=""Author""><Exec><Command>{SecurityElement.Escape(exePath)}</Command><Arguments>--tray</Arguments></Exec></Actions>
+</Task>";
+
+            string tmp = Path.Combine(Path.GetTempPath(), $"pulseram_task_{Guid.NewGuid():N}.xml");
+            try
+            {
+                File.WriteAllText(tmp, xml, Encoding.Unicode);
+                return RunSchtasks($"/Create /F /TN \"{ElevatedStartupTaskName}\" /XML \"{tmp}\"") == 0;
+            }
+            finally
+            {
+                try { File.Delete(tmp); } catch { }
+            }
+        }
+
+        private static int RunSchtasks(string args)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "schtasks.exe"), args)
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using var p = Process.Start(psi);
+                if (p == null) return -1;
+                p.StandardOutput.ReadToEnd();
+                p.StandardError.ReadToEnd();
+                return p.WaitForExit(15000) ? p.ExitCode : -1;
             }
             catch
             {
-                return false;
+                return -1;
             }
         }
 
@@ -1448,8 +2471,17 @@ namespace PulseRAM
 
         public void Dispose()
         {
-            _backgroundTimer?.Dispose();
+            if (_disposed) return;
+            _disposed = true;
+            try
+            {
+                using var done = new ManualResetEvent(false);
+                if (_backgroundTimer != null && _backgroundTimer.Dispose(done))
+                    done.WaitOne(3000);
+            }
+            catch { }
             ThawAllApps();
+            _memCounters.Dispose();
         }
     }
 }
