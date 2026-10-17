@@ -33,8 +33,18 @@ jobs:
         shell: pwsh
         run: |
           # The csproj turns PRI generation off for quick local builds; the release build needs
-          # resources.pri and the Microsoft.UI.Xaml theme files, so turn it back on here.
-          dotnet publish PulseRAM.csproj -c Release -r win-x64 --self-contained true -o publish_selfcontained `
+          # resources.pri and the Microsoft.UI.Xaml theme files, so turn it back on here. The PRI tasks ship
+          # with Visual Studio (not the dotnet CLI), so publish with Visual Studio's MSBuild.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -prerelease -products * -requires Microsoft.Component.MSBuild -property installationPath
+          Write-Host "Visual Studio: $vs"
+          $msbuild = Join-Path $vs "MSBuild\Current\Bin\amd64\MSBuild.exe"
+          & $msbuild -version
+          Get-ChildItem (Join-Path $vs "MSBuild\Microsoft\VisualStudio") -Recurse -Filter Microsoft.Build.Packaging.Pri.Tasks.dll -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "PRI tasks: $($_.FullName)" }
+          $out = Join-Path $PWD "publish_selfcontained\"
+          & $msbuild PulseRAM.csproj -restore -t:Publish -v:minimal -nologo `
+            -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:SelfContained=true `
+            "-p:PublishDir=$out" `
             -p:EnableCoreMrtTooling=true -p:AppxGeneratePriEnabled=true -p:IncludeProjectPriFile=true
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
