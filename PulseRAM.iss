@@ -4,7 +4,7 @@
 ; -----------------------------------------------------------------------------
 
 #define MyAppName "PulseRAM"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Hiirocchi18"
 #define MyAppURL "https://github.com/Hiirocchi18/PulseRAM"
 #define MyAppExeName "PulseRAM.exe"
