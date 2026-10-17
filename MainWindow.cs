@@ -89,6 +89,72 @@ namespace PulseRAM
         private const uint MSGFLT_ALLOW = 1;
 
         [StructLayout(LayoutKind.Sequential)]
+        private struct ICONINFO
+        {
+            [MarshalAs(UnmanagedType.Bool)] public bool fIcon;
+            public int xHotspot;
+            public int yHotspot;
+            public IntPtr hbmMask;
+            public IntPtr hbmColor;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BITMAPINFOHEADER
+        {
+            public uint biSize;
+            public int biWidth;
+            public int biHeight;
+            public ushort biPlanes;
+            public ushort biBitCount;
+            public uint biCompression;
+            public uint biSizeImage;
+            public int biXPelsPerMeter;
+            public int biYPelsPerMeter;
+            public uint biClrUsed;
+            public uint biClrImportant;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr CreateIconIndirect(ref ICONINFO piconinfo);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyIcon(IntPtr hIcon);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFOHEADER pbmi, uint usage, out IntPtr ppvBits, IntPtr hSection, uint offset);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr CreateBitmap(int nWidth, int nHeight, uint nPlanes, uint nBitCount, IntPtr lpBits);
+
+        [DllImport("gdi32.dll")]
+        private static extern bool DeleteObject(IntPtr hObject);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetDpiForWindow(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        private static extern int GetSystemMetricsForDpi(int nIndex, uint dpi);
+
+        private const int SM_CXSMICON = 49;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_POWER_THROTTLING_STATE
+        {
+            public uint Version;
+            public uint ControlMask;
+            public uint StateMask;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetProcessInformation(IntPtr hProcess, int ProcessInformationClass, ref PROCESS_POWER_THROTTLING_STATE ProcessInformation, uint ProcessInformationSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetPriorityClass(IntPtr hProcess, uint dwPriorityClass);
+
+        [StructLayout(LayoutKind.Sequential)]
         private struct POINT { public int X; public int Y; }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -151,6 +217,9 @@ namespace PulseRAM
         private IntPtr _customHIcon = IntPtr.Zero;
         private NOTIFYICONDATA _trayData;
         private bool _trayInitialized = false;
+        private IntPtr _trayPercentIcon = IntPtr.Zero;   // live RAM % icon currently shown (owned by us)
+        private string _trayIconKey = "";                // percent|color|size of the icon being shown
+        private bool _selfEfficiencyOn = false;
         private uint _showWindowMsg = 0;
         private uint _taskbarCreatedMsg = 0;
         private uint _exitForInstallerMsg = 0;
@@ -207,6 +276,7 @@ namespace PulseRAM
         private Border _apStatusPill = null!;
         private readonly ToolTip _apStatusTip = new ToolTip();
         private readonly ToolTip _adminTip = new ToolTip();
+        private readonly ToolTip _standbyTip = new ToolTip();
         private TextBlock _sessionFreedTopText = null!;
         private Button _miniHudBtn = null!;
         private Button _adminBtn = null!;
@@ -671,14 +741,196 @@ namespace PulseRAM
             catch { }
         }
 
-        private void UpdateTrayTooltip(double ramPct, double availGb)
+        private void UpdateTrayTooltip(MemorySnapshot snap)
         {
             if (!_trayInitialized) return;
             try
             {
                 _trayData.uFlags = NIF_TIP;
-                _trayData.szTip = $"PulseRAM: {ramPct:F1}% Used ({availGb:F2} GB Available)";
+                _trayData.szTip = $"PulseRAM: {snap.Percent:F1}% used · {snap.AvailableGb:F2} GB available";
+
+                if (_engine.Config.TrayShowsPercent)
+                {
+                    int pct = (int)Math.Clamp(Math.Round(snap.Percent), 0, 99);
+                    string hex = snap.PressureLevel == "CRITICAL" ? "#E11D48" : (snap.PressureLevel == "ELEVATED" ? "#F59E0B" : "#059669");
+                    int size = TrayIconSize();
+                    string key = $"{pct}|{hex}|{size}";
+                    if (key != _trayIconKey)
+                    {
+                        IntPtr icon = CreatePercentIcon(pct, hex, size, darkText: snap.PressureLevel == "ELEVATED");
+                        if (icon != IntPtr.Zero)
+                        {
+                            _trayData.uFlags |= NIF_ICON;
+                            _trayData.hIcon = icon;
+                            if (Shell_NotifyIcon(NIM_MODIFY, ref _trayData))
+                            {
+                                if (_trayPercentIcon != IntPtr.Zero) DestroyIcon(_trayPercentIcon);
+                                _trayPercentIcon = icon;
+                                _trayIconKey = key;
+                            }
+                            else
+                            {
+                                DestroyIcon(icon);
+                            }
+                            return;
+                        }
+                    }
+                }
+                else if (_trayPercentIcon != IntPtr.Zero)
+                {
+                    // Switched off: go back to the app icon.
+                    _trayData.uFlags |= NIF_ICON;
+                    _trayData.hIcon = _customHIcon != IntPtr.Zero ? _customHIcon : LoadIcon(IntPtr.Zero, new IntPtr(32512));
+                    Shell_NotifyIcon(NIM_MODIFY, ref _trayData);
+                    DestroyIcon(_trayPercentIcon);
+                    _trayPercentIcon = IntPtr.Zero;
+                    _trayIconKey = "";
+                    return;
+                }
+
                 Shell_NotifyIcon(NIM_MODIFY, ref _trayData);
+            }
+            catch { }
+        }
+
+        /// <summary>Small-icon size for the tray at this window's DPI (16 px at 100%, 24 at 150%, 32 at 200%).</summary>
+        private int TrayIconSize()
+        {
+            try
+            {
+                uint dpi = GetDpiForWindow(_hwnd);
+                int size = GetSystemMetricsForDpi(SM_CXSMICON, dpi == 0 ? 96 : dpi);
+                return Math.Clamp(size, 16, 64);
+            }
+            catch
+            {
+                return 16;
+            }
+        }
+
+        // 3×5 pixel digits, one string per row ('#' = lit).
+        private static readonly string[][] PixelDigits =
+        {
+            new[] { "###", "#.#", "#.#", "#.#", "###" }, // 0
+            new[] { ".#.", "##.", ".#.", ".#.", "###" }, // 1
+            new[] { "###", "..#", "###", "#..", "###" }, // 2
+            new[] { "###", "..#", "###", "..#", "###" }, // 3
+            new[] { "#.#", "#.#", "###", "..#", "..#" }, // 4
+            new[] { "###", "#..", "###", "..#", "###" }, // 5
+            new[] { "###", "#..", "###", "#.#", "###" }, // 6
+            new[] { "###", "..#", "..#", "..#", "..#" }, // 7
+            new[] { "###", "#.#", "###", "#.#", "###" }, // 8
+            new[] { "###", "#.#", "###", "..#", "###" }, // 9
+        };
+
+        /// <summary>
+        /// Draws the RAM percentage as a crisp pixel-font badge (rounded square colored by memory pressure) and
+        /// returns an HICON the caller must destroy. Pure GDI, no extra libraries, scales with DPI.
+        /// </summary>
+        private static IntPtr CreatePercentIcon(int percent, string bgHex, int size, bool darkText)
+        {
+            string h = bgHex.TrimStart('#');
+            uint bg = 0xFF000000u | (Convert.ToUInt32(h.Substring(0, 2), 16) << 16) | (Convert.ToUInt32(h.Substring(2, 2), 16) << 8) | Convert.ToUInt32(h.Substring(4, 2), 16);
+            uint fg = darkText ? 0xFF111827u : 0xFFFFFFFFu;
+
+            var px = new uint[size * size];
+            double r = Math.Max(2, size / 5);
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    // Distance from the nearest corner-circle centre; only matters inside the corner squares.
+                    double fx = x + 0.5, fy = y + 0.5;
+                    double qx = fx < r ? r - fx : (fx > size - r ? fx - (size - r) : 0);
+                    double qy = fy < r ? r - fy : (fy > size - r ? fy - (size - r) : 0);
+                    if (qx * qx + qy * qy <= r * r) px[y * size + x] = bg;
+                }
+            }
+
+            string text = percent.ToString();
+            int scale = Math.Max(1, Math.Min((size - 2) / (text.Length * 4 - 1), (size - 2) / 5));
+            int textW = (text.Length * 4 - 1) * scale;
+            int textH = 5 * scale;
+            int ox = (size - textW) / 2;
+            int oy = (size - textH) / 2;
+            for (int c = 0; c < text.Length; c++)
+            {
+                var glyph = PixelDigits[text[c] - '0'];
+                for (int gy = 0; gy < 5; gy++)
+                {
+                    for (int gx = 0; gx < 3; gx++)
+                    {
+                        if (glyph[gy][gx] != '#') continue;
+                        for (int sy = 0; sy < scale; sy++)
+                        {
+                            for (int sx = 0; sx < scale; sx++)
+                            {
+                                int x = ox + (c * 4 + gx) * scale + sx;
+                                int y = oy + gy * scale + sy;
+                                if (x >= 0 && x < size && y >= 0 && y < size) px[y * size + x] = fg;
+                            }
+                        }
+                    }
+                }
+            }
+
+            var bmi = new BITMAPINFOHEADER
+            {
+                biSize = (uint)Marshal.SizeOf<BITMAPINFOHEADER>(),
+                biWidth = size,
+                biHeight = -size, // top-down
+                biPlanes = 1,
+                biBitCount = 32,
+                biCompression = 0 // BI_RGB
+            };
+            IntPtr color = CreateDIBSection(IntPtr.Zero, ref bmi, 0, out IntPtr bits, IntPtr.Zero, 0);
+            if (color == IntPtr.Zero) return IntPtr.Zero;
+            IntPtr mask = IntPtr.Zero;
+            try
+            {
+                var bytes = new int[px.Length];
+                Buffer.BlockCopy(px, 0, bytes, 0, px.Length * 4);
+                Marshal.Copy(bytes, 0, bits, bytes.Length);
+                // Monochrome AND-mask, all zero: the colour bitmap's alpha channel carries transparency.
+                int maskStride = ((size + 15) / 16) * 2;
+                IntPtr maskBits = Marshal.AllocHGlobal(maskStride * size);
+                try
+                {
+                    Marshal.Copy(new byte[maskStride * size], 0, maskBits, maskStride * size);
+                    mask = CreateBitmap(size, size, 1, 1, maskBits);
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(maskBits);
+                }
+                var info = new ICONINFO { fIcon = true, hbmColor = color, hbmMask = mask };
+                return CreateIconIndirect(ref info);
+            }
+            finally
+            {
+                DeleteObject(color);
+                if (mask != IntPtr.Zero) DeleteObject(mask);
+            }
+        }
+
+        /// <summary>
+        /// While the dashboard is hidden PulseRAM only watches memory, so let Windows run it in Efficiency Mode
+        /// (EcoQoS + below-normal priority) — the same trick H.NotifyIcon uses for tray apps.
+        /// </summary>
+        private void SetSelfEfficiencyMode(bool on)
+        {
+            if (on == _selfEfficiencyOn) return;
+            try
+            {
+                var state = new PROCESS_POWER_THROTTLING_STATE
+                {
+                    Version = 1,
+                    ControlMask = on ? 1u : 0u,   // 0 = let Windows decide again
+                    StateMask = on ? 1u : 0u
+                };
+                bool qos = SetProcessInformation(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, ref state, (uint)Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>());
+                bool prio = SetPriorityClass(GetCurrentProcess(), on ? 0x00004000u /* BELOW_NORMAL */ : 0x00000020u /* NORMAL */);
+                if (qos || prio) _selfEfficiencyOn = on;
             }
             catch { }
         }
@@ -807,6 +1059,7 @@ namespace PulseRAM
             {
                 // Explorer restarted: the old icon is gone, add it again.
                 _trayInitialized = false;
+                _trayIconKey = "";
                 InitializeSystemTrayIcon();
             }
             return CallWindowProc(_oldWndProc, hWnd, msg, wParam, lParam);
@@ -871,6 +1124,11 @@ namespace PulseRAM
                 if (_trayInitialized)
                 {
                     Shell_NotifyIcon(NIM_DELETE, ref _trayData);
+                }
+                if (_trayPercentIcon != IntPtr.Zero)
+                {
+                    DestroyIcon(_trayPercentIcon);
+                    _trayPercentIcon = IntPtr.Zero;
                 }
                 _engine.Dispose();
             }
@@ -1477,7 +1735,9 @@ namespace PulseRAM
             legGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
             legGrid.Children.Add(CreateLegendCell("In Use", "#38BDF8", out _legUsedText, 0));
-            legGrid.Children.Add(CreateLegendCell("Standby", "#818CF8", out _legCacheText, 1));
+            var standbyCell = CreateLegendCell("Standby", "#818CF8", out _legCacheText, 1);
+            ToolTipService.SetToolTip(standbyCell, _standbyTip);
+            legGrid.Children.Add(standbyCell);
             legGrid.Children.Add(CreateLegendCell("Available", "#10B981", out _legAvailText, 2));
             mapStack.Children.Add(legGrid);
             mapBox.Child = mapStack;
@@ -2402,6 +2662,35 @@ namespace PulseRAM
             var info = new StackPanel { Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
             info.Children.Add(new TextBlock { Text = "DEVICE", FontSize = 13, FontWeight = FontWeights.Bold, Foreground = BrushHex("#38BDF8") });
             info.Children.Add(new TextBlock { Text = _engine.Device.Label, FontSize = 12, Foreground = BrushHex("#F8FAFC") });
+
+            var opts = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 14, Margin = new Thickness(0, 4, 0, 0) };
+            var chkTray = new CheckBox { Content = "Tray %", FontSize = 12, MinWidth = 0, IsChecked = _engine.Config.TrayShowsPercent };
+            ToolTipService.SetToolTip(chkTray, "Show the live RAM % in the tray icon (green → amber → red with memory pressure).");
+            chkTray.Click += (s, e) =>
+            {
+                _engine.Config.TrayShowsPercent = chkTray.IsChecked == true;
+                _engine.SaveConfig();
+                _trayIconKey = "";
+                UpdateTrayTooltip(_engine.GetSnapshot());
+            };
+            var chkEco = new CheckBox { Content = "Eco in tray", FontSize = 12, MinWidth = 0, IsChecked = _engine.Config.EfficiencyModeWhenHidden };
+            ToolTipService.SetToolTip(chkEco, "Run PulseRAM itself in Windows Efficiency Mode while it is hidden in the tray.");
+            chkEco.Click += (s, e) =>
+            {
+                _engine.Config.EfficiencyModeWhenHidden = chkEco.IsChecked == true;
+                _engine.SaveConfig();
+            };
+            var chkSmartPurge = new CheckBox { Content = "Smart purge", FontSize = 12, MinWidth = 0, IsChecked = _engine.Config.SmartStandbyPurge };
+            ToolTipService.SetToolTip(chkSmartPurge, "Automatic sweeps only empty the standby cache when free memory is low or Windows is already evicting cache. Manual sweeps always purge.");
+            chkSmartPurge.Click += (s, e) =>
+            {
+                _engine.Config.SmartStandbyPurge = chkSmartPurge.IsChecked == true;
+                _engine.SaveConfig();
+            };
+            opts.Children.Add(chkTray);
+            opts.Children.Add(chkEco);
+            opts.Children.Add(chkSmartPurge);
+            info.Children.Add(opts);
             row.Children.Add(info);
 
             var cmbUi = new ComboBox { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, MinWidth = 120 };
@@ -2697,6 +2986,35 @@ namespace PulseRAM
             }
         }
 
+        /// <summary>Standby cache explained: per-priority sizes, eviction rate, and whether a purge would help.</summary>
+        private string BuildStandbyTooltip(MemorySnapshot snap)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("Cached files Windows can drop instantly when an app needs RAM.");
+            if (snap.StandbyByPriorityGb is { Length: 8 } p)
+            {
+                sb.Append("\n\nBy priority (0 = least important):");
+                sb.Append($"\n0–1: {p[0] + p[1]:F2} GB · 2–4: {p[2] + p[3] + p[4]:F2} GB · 5–7: {p[5] + p[6] + p[7]:F2} GB");
+                if (snap.RepurposeMbPerMin >= 0)
+                    sb.Append($"\nBeing evicted: {snap.RepurposeMbPerMin:0} MB/min");
+            }
+            else
+            {
+                sb.Append("\n\nRun as Admin to see it by priority.");
+            }
+            if (!snap.StandbyPurgeSupported)
+                sb.Append("\n\nPurging the cache needs Admin.");
+            else if (snap.StandbyPurgeWorthwhile)
+                sb.Append("\n\nFree memory is low — a purge would help.");
+            else if (!_engine.Config.SmartStandbyPurge)
+                sb.Append("\n\nSmart purge is off — automatic sweeps purge anyway.");
+            else if (snap.StandbyAndCacheGb < Math.Max(0.5, snap.TotalGb * 0.10))
+                sb.Append("\n\nThe cache is small — Auto-Pilot leaves it alone.");
+            else
+                sb.Append("\n\nFree memory is fine — Auto-Pilot leaves the cache alone.");
+            return sb.ToString();
+        }
+
         /// <summary>Describes an optimization using only measured values.</summary>
         private static (string Title, string Sub) DescribeEvent(OptimizationEvent ev)
         {
@@ -2713,6 +3031,7 @@ namespace PulseRAM
             if (ev.Mode != "STANDBY") parts.Add($"Available +{FormatMb(ev.AvailableGainMb)}");
             parts.Add($"RAM {ev.BeforePercent:F1}% → {ev.AfterPercent:F1}%");
             if (ev.StandbyPurged && ev.Mode != "STANDBY") parts.Add("standby purged");
+            if (ev.CombinedMb >= 1) parts.Add($"{FormatMb(ev.CombinedMb)} deduplicated");
             if (!string.IsNullOrEmpty(ev.Note)) parts.Add(ev.Note);
             return (title, string.Join(" · ", parts));
         }
@@ -2817,8 +3136,9 @@ namespace PulseRAM
             if (!force && !IsDashboardVisible())
             {
                 var hiddenSnap = _engine.GetSnapshot();
-                UpdateTrayTooltip(hiddenSnap.Percent, hiddenSnap.AvailableGb);
+                UpdateTrayTooltip(hiddenSnap);
                 SetAnimationsPaused(true);
+                SetSelfEfficiencyMode(_engine.Config.EfficiencyModeWhenHidden);
                 return;
             }
             SetAnimationsPaused(_reduceMotion);
@@ -2831,7 +3151,8 @@ namespace PulseRAM
                 var events = _engine.GetEvents();
                 var telemetry = _engine.GetTelemetry();
 
-                UpdateTrayTooltip(snap.Percent, snap.AvailableGb);
+                UpdateTrayTooltip(snap);
+                SetSelfEfficiencyMode(false);
 
                 // Top Command Header
                 _clockText.Text = DateTime.Now.ToString("HH:mm:ss");
@@ -2890,6 +3211,8 @@ namespace PulseRAM
                 _colSegFree.Width = new GridLength(Math.Max(2, freeRatio * 100), GridUnitType.Star);
                 _legUsedText.Text = $"{snap.UsedGb:F2} GB";
                 _legCacheText.Text = snap.MemoryListsMeasured ? $"{snap.StandbyAndCacheGb:F2} GB" : $"~{snap.StandbyAndCacheGb:F2} GB (est.)";
+                string standbyTip = BuildStandbyTooltip(snap);
+                if (!Equals(_standbyTip.Content, standbyTip)) _standbyTip.Content = standbyTip;
                 _legAvailText.Text = $"{snap.AvailableGb:F2} GB";
 
                 if (_selectedMode == "standby")

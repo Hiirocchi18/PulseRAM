@@ -72,6 +72,8 @@ The interface is deliberately minimal: short labels, with details in hover toolt
 | **Standby Purge** | Flushes the modified list and purges the whole standby list. Does nothing (and says so) without admin. | Yes |
 | **Max Overdrive** (Extreme) | Deep trim + page combining + modified flush + **full** standby purge. | For the kernel part |
 
+**Smart standby purge.** Emptying the standby cache only helps when free memory is actually scarce — otherwise Windows already hands out free pages and the purge just throws away useful cache, so apps reload from disk. Automatic sweeps therefore purge only when free memory is low (under ~4% of RAM) or Windows is already evicting cache (≥ 64 MB/min of repurposed standby pages, read from the kernel's memory lists like [System Informer](https://github.com/winsiderss/systeminformer) does). Manual sweeps always purge. Hover **Standby** on the dashboard to see the cache by priority and the current eviction rate.
+
 Shielded apps, critical system processes and (by default) the foreground app are skipped in **every** mode.
 
 ### 4. Process Inspector & Quick Governor
@@ -90,7 +92,8 @@ Shielded apps, critical system processes and (by default) the foreground app are
   * `Ctrl + Alt + Shift + M`: Smart Trim of idle background apps.
   * `Ctrl + Alt + Shift + P`: Deep Sweep.
   * The defaults avoid `Ctrl+Shift+M` (Teams mute) and `Ctrl+Shift+P` (VS Code command palette). If a hotkey is already taken, PulseRAM tells you instead of failing silently.
-* **Win32 System Tray**: Live tooltip memory metrics and quick-action context menu. Launching PulseRAM again while it's in the tray brings the existing window forward.
+* **Live tray icon**: shows the current RAM % (green → amber → red with memory pressure), drawn crisply for any display scaling. Live tooltip and a quick-action menu; launching PulseRAM again brings the existing window forward.
+* **Light in the tray**: while hidden, PulseRAM stops drawing its UI and runs itself in Windows **Efficiency Mode** (EcoQoS, below-normal priority).
 
 ### 6. Windows Startup
 * Toggle **Windows Startup** on the dashboard. When PulseRAM is running **as administrator**, startup is registered as an elevated Task Scheduler task (`PulseRAM Elevated Startup`) so Standby/Deep/Max kernel purges keep working after a reboot. Otherwise it uses the per-user `HKCU\...\Run` key and starts as a standard user.
@@ -146,7 +149,7 @@ dotnet build -c Release -r win-x64
 .\Build-Installer.ps1
 ```
 
-The compiled single-file installer will be located in `dist\PulseRAM-Setup-v1.1.0.exe`.
+The compiled single-file installer will be located in `dist\PulseRAM-Setup-v1.2.0.exe`.
 
 Every push is also built on GitHub Actions (`.github/workflows/build.yml`): publish, resource check, a launch smoke test, the Inno Setup installer, and a silent install → launch → uninstall test. The installer is attached to the run as an artifact.
 
