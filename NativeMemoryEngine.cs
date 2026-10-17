@@ -115,6 +115,8 @@ namespace PulseRAM
         public double CombinedMb { get; set; }
         /// <summary>True when nothing was done (e.g. a kernel-only mode without administrator rights).</summary>
         public bool Skipped { get; set; }
+        /// <summary>Automatic purge deliberately not done because there was no memory pressure (not logged, no back-off).</summary>
+        public bool SkippedNoPressure { get; set; }
         /// <summary>Extra human-readable detail, e.g. why the kernel purge was skipped.</summary>
         public string Note { get; set; } = "";
     }
@@ -330,6 +332,58 @@ namespace PulseRAM
 
         [DllImport("ntdll.dll")]
         private static extern int NtSuspendProcess(IntPtr ProcessHandle);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct THREAD_POWER_THROTTLING_STATE
+        {
+            public uint Version;
+            public uint ControlMask;
+            public uint StateMask;
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentThread();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetThreadInformation(IntPtr hThread, int ThreadInformationClass, ref THREAD_POWER_THROTTLING_STATE ThreadInformation, uint ThreadInformationSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetThreadPriority(IntPtr hThread, int nPriority);
+
+        /// <summary>
+        /// While PulseRAM sits in Efficiency Mode, a sweep must still run at full speed — it is needed exactly
+        /// when the PC is under load. Opts the current thread out of EcoQoS and raises it to the normal-class
+        /// level for the duration of the sweep, then restores it.
+        /// </summary>
+        private readonly struct SweepBoost : IDisposable
+        {
+            private const int ThreadPowerThrottling = 3;
+            private const int THREAD_PRIORITY_NORMAL = 0;
+            private const int THREAD_PRIORITY_HIGHEST = 2; // below-normal class + highest ≈ normal-class normal
+
+            public static SweepBoost Begin()
+            {
+                try
+                {
+                    var st = new THREAD_POWER_THROTTLING_STATE { Version = 1, ControlMask = 1, StateMask = 0 }; // high QoS
+                    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, ref st, (uint)Marshal.SizeOf<THREAD_POWER_THROTTLING_STATE>());
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+                }
+                catch { }
+                return new SweepBoost();
+            }
+
+            public void Dispose()
+            {
+                try
+                {
+                    var st = new THREAD_POWER_THROTTLING_STATE { Version = 1, ControlMask = 0, StateMask = 0 }; // back to default
+                    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, ref st, (uint)Marshal.SizeOf<THREAD_POWER_THROTTLING_STATE>());
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+                }
+                catch { }
+            }
+        }
 
         [DllImport("ntdll.dll")]
         private static extern int NtResumeProcess(IntPtr ProcessHandle);
@@ -637,6 +691,7 @@ namespace PulseRAM
         private double _repurposeMbPerMin = -1;
         private bool _memListQueryFailed;
         private readonly object _repurposeLock = new object();
+        private DateTime _memListRetryAt = DateTime.MinValue;
 
         private List<ProcessItem> _cachedGroupedProcesses = new List<ProcessItem>();
         private List<ProcessItem> _cachedIndividualProcesses = new List<ProcessItem>();
@@ -1111,7 +1166,9 @@ namespace PulseRAM
                             // trimming again soon would only cause page-fault churn, so back off exponentially.
                             var after = _lastSnapshot;
                             bool stillPressured = after.Percent >= effectiveThreshold || after.AvailableGb <= Config.MinFreeRamGb;
-                            if (stillPressured || ev.Skipped)
+                            // A deliberate no-pressure skip is temporary: never back off for it, or a later real
+                            // shortage could wait up to 30 minutes.
+                            if (!ev.SkippedNoPressure && (stillPressured || ev.Skipped))
                                 _autoBackoffLevel = Math.Min(_autoBackoffLevel + 1, 6);
                             return;
                         }
@@ -1277,6 +1334,7 @@ namespace PulseRAM
             // Kernel memory lists (same data as System Informer's "Memory lists"): standby per priority and the
             // cumulative count of standby pages Windows has repurposed. Needs SeProfileSingleProcessPrivilege.
             double[]? standbyByPriority = null;
+            if (_memListQueryFailed && DateTime.Now >= _memListRetryAt) _memListQueryFailed = false;
             if (_privilegesEnabled && !_memListQueryFailed)
             {
                 try
@@ -1299,28 +1357,36 @@ namespace PulseRAM
                         var now = DateTime.Now;
                         lock (_repurposeLock)
                         {
-                        if (_lastRepurposeSample != DateTime.MinValue && repurposed >= _lastRepurposedPages)
+                        bool advance = _lastRepurposeSample == DateTime.MinValue || repurposed < _lastRepurposedPages;
+                        if (!advance)
                         {
                             double minutes = (now - _lastRepurposeSample).TotalMinutes;
                             if (minutes >= 0.02)
                             {
                                 double mbPerMin = (repurposed - _lastRepurposedPages) * pageSize / (1024.0 * 1024.0) / minutes;
-                                // Smooth it so one burst doesn't flip the decision.
-                                _repurposeMbPerMin = _repurposeMbPerMin < 0 ? mbPerMin : _repurposeMbPerMin * 0.7 + mbPerMin * 0.3;
+                                // Smooth it so one burst doesn't flip the decision (weight grows with the interval).
+                                double w = Math.Clamp(minutes / 0.25, 0.1, 1.0) * 0.5;
+                                _repurposeMbPerMin = _repurposeMbPerMin < 0 ? mbPerMin : _repurposeMbPerMin * (1 - w) + mbPerMin * w;
+                                advance = true;
                             }
                         }
-                        _lastRepurposedPages = repurposed;
-                        _lastRepurposeSample = now;
+                        if (advance)
+                        {
+                            _lastRepurposedPages = repurposed;
+                            _lastRepurposeSample = now;
+                        }
                         }
                     }
                     else
                     {
                         _memListQueryFailed = true;
+                        _memListRetryAt = DateTime.Now.AddMinutes(5);
                     }
                 }
                 catch
                 {
                     _memListQueryFailed = true;
+                    _memListRetryAt = DateTime.Now.AddMinutes(5);
                 }
             }
 
@@ -1790,6 +1856,7 @@ namespace PulseRAM
         {
             lock (_optimizeLock)
             {
+                using var boost = SweepBoost.Begin();
                 return OptimizeMemoryCore(mode, trigger, reason);
             }
         }
@@ -1810,11 +1877,14 @@ namespace PulseRAM
             // Smart standby purge: on automatic sweeps, skip the cache purge unless it would actually help.
             bool skipPurgeNoPressure = wantsKernel && _privilegesEnabled && Config.SmartStandbyPurge
                 && IsAutomaticTrigger(trigger) && !beforeSnap.StandbyPurgeWorthwhile;
-            string noPressureNote = $"Standby purge skipped: {beforeSnap.FreeExactGb:F1} GB already free and Windows isn't evicting cache, so purging would only discard useful cache.";
+            string noPressureNote = beforeSnap.StandbyAndCacheGb < Math.Max(0.5, beforeSnap.TotalGb * 0.10)
+                ? $"Standby purge skipped: the cache is small ({beforeSnap.StandbyAndCacheGb:F1} GB), so there is little to gain."
+                : $"Standby purge skipped: {beforeSnap.FreeExactGb:F1} GB already free and Windows isn't evicting cache, so purging would only discard useful cache.";
 
             if (normMode == "standby" && skipPurgeNoPressure)
             {
-                return RecordEvent(new OptimizationEvent
+                // Nothing worth doing right now: not logged or announced, and the next tick simply re-checks.
+                return new OptimizationEvent
                 {
                     Mode = "STANDBY",
                     Trigger = trigger,
@@ -1823,8 +1893,9 @@ namespace PulseRAM
                     AfterPercent = beforeSnap.Percent,
                     DurationMs = sw.ElapsedMilliseconds,
                     Skipped = true,
+                    SkippedNoPressure = true,
                     Note = noPressureNote
-                }, countAsOptimization: false, trigger);
+                };
             }
 
             if (normMode == "standby" && !_privilegesEnabled)
@@ -1920,7 +1991,7 @@ namespace PulseRAM
                     if (NtSetSystemInformation(SystemCombinePhysicalMemoryInformation, ref combineInfo, Marshal.SizeOf<MEMORY_COMBINE_INFORMATION_EX>()) == 0)
                     {
                         pagesCombined = true;
-                        combinedMb = combineInfo.PagesCombined.ToUInt64() * 4096.0 / (1024.0 * 1024.0);
+                        combinedMb = combineInfo.PagesCombined.ToUInt64() * (double)Environment.SystemPageSize / (1024.0 * 1024.0);
                     }
                 }
 
@@ -2084,6 +2155,7 @@ namespace PulseRAM
         {
             lock (_optimizeLock)
             {
+                using var boost = SweepBoost.Begin();
                 var sw = Stopwatch.StartNew();
                 var beforeSnap = SampleTelemetryAndProcesses(forceProcessScan: false, recordTelemetry: false);
 
