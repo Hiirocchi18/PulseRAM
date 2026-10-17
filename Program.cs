@@ -17,6 +17,9 @@ namespace PulseRAM
         private static PulseRamApp? _appInstance;
         public static MainWindow? ActiveMainWindow;
 
+        /// <summary>True when the previous session did not shut down cleanly (crash, kill, power loss).</summary>
+        public static bool PreviousSessionCrashed { get; private set; }
+
         /// <summary>Broadcast by a second launch so the running instance shows its window.</summary>
         public const string ShowWindowMessageName = "PulseRAM.ShowMainWindow.v1";
 
@@ -103,6 +106,18 @@ namespace PulseRAM
                 }
             }
 
+            PreviousSessionCrashed = Log.MarkSessionStart();
+            if (PreviousSessionCrashed) Log.Warn("Previous session ended without a clean shutdown");
+
+            // Crash logging: background-thread exceptions are fatal in .NET; at least record why.
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+                Log.Error($"Fatal unhandled exception (terminating={e.IsTerminating})", e.ExceptionObject as Exception);
+            System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (s, e) =>
+            {
+                Log.Error("Unobserved task exception", e.Exception);
+                e.SetObserved();
+            };
+
             WinRT.ComWrappersSupport.InitializeComWrappers();
 
             Application.Start(p =>
@@ -129,7 +144,10 @@ namespace PulseRAM
             RequestedTheme = ApplicationTheme.Dark;
             UnhandledException += (s, e) =>
             {
+                // Keep running, but never silently: log it and let the user know where to look.
+                Log.Error($"UI exception: {e.Message}", e.Exception);
                 e.Handled = true;
+                Program.ActiveMainWindow?.ReportUnexpectedError(e.Message);
             };
         }
 

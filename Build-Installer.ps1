@@ -7,7 +7,7 @@
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Set-Location $ScriptDir
-$Version = "1.2.0"   # keep in sync with PulseRAM.csproj <Version> and PulseRAM.iss MyAppVersion
+$Version = "1.3.0"   # keep in sync with PulseRAM.csproj <Version> and PulseRAM.iss MyAppVersion
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "  PulseRAM — Compiling Full Package Installer (v$Version)" -ForegroundColor Cyan
