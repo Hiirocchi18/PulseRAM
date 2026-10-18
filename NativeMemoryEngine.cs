@@ -2388,6 +2388,15 @@ namespace PulseRAM
             lock (_stateLock) _leakHistory.Dismiss(app, DateTime.Now);
         }
 
+        /// <summary>Forgets an app entirely (e.g. after it was restarted: the new process starts with a clean slate).</summary>
+        public void ForgetLeak(string app)
+        {
+            lock (_stateLock) _leakHistory.Forget(app);
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetShellWindow();
+
         /// <summary>Removes an app from the list and stops tracking it for good (undo by editing LeakIgnoredApps in the config).</summary>
         public void IgnoreLeak(string app)
         {
@@ -2416,7 +2425,7 @@ namespace PulseRAM
             {
                 if (procs.Length == 0)
                 {
-                    DismissLeak(app);
+                    ForgetLeak(app);
                     return (true, $"{name} is no longer running.");
                 }
 
@@ -2444,15 +2453,18 @@ namespace PulseRAM
                 if (!allExited)
                     return (false, $"{name} is still open (it may be asking to save). Finish closing it, then start it again.");
 
-                DismissLeak(app);
+                ForgetLeak(app); // a fresh process: if it leaks again it should show up again
                 if (path == null)
                     return (true, $"{name} closed. Start it again from the Start menu.");
                 try
                 {
                     if (IsAdmin)
                     {
-                        // Don't hand our administrator rights to the app: let Explorer (which runs as the normal
-                        // user) start it, exactly as if it was launched from the Start menu.
+                        // Don't hand our administrator rights to the app: ask the running (non-elevated) Explorer
+                        // shell to start it, as if it was launched from the Start menu. Without a shell, a new
+                        // explorer.exe would inherit our elevation, so leave the relaunch to the user then.
+                        if (GetShellWindow() == IntPtr.Zero)
+                            return (true, $"{name} closed. Start it again from the Start menu.");
                         Process.Start(new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"))
                         {
                             ArgumentList = { path },
@@ -2463,8 +2475,21 @@ namespace PulseRAM
                     {
                         Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
                     }
-                    Log.Info($"Restarted {name} to release leaked memory");
-                    return (true, $"{name} restarted.");
+
+                    // Explorer returns before the app starts, so confirm it actually came back.
+                    var until = DateTime.UtcNow.AddSeconds(8);
+                    bool back = false;
+                    while (!back && DateTime.UtcNow < until)
+                    {
+                        Thread.Sleep(400);
+                        var again = Process.GetProcessesByName(name);
+                        back = again.Length > 0;
+                        foreach (var p in again) p.Dispose();
+                    }
+                    Log.Info(back ? $"Restarted {name} to release leaked memory" : $"Closed {name}; it did not start again within 8 s");
+                    return back
+                        ? (true, $"{name} restarted.")
+                        : (true, $"{name} closed, but Windows didn't start it again. Start it from the Start menu.");
                 }
                 catch (Exception ex)
                 {

@@ -146,14 +146,35 @@ jobs:
           Stop-Process -Id $p.Id -Force
           Start-Sleep -Seconds 2
 
-          # 2) Second run: no welcome card; dark theme to exercise the other palette.
-          (Get-Content $cfg -Raw) -replace '"Theme":\s*"system"', '"Theme": "dark"' | Set-Content $cfg -Encoding utf8
+          # 2) Second run: no welcome card. Runs > 30 s so the scheduled update check happens, and switches
+          #    Windows to dark mode while running to exercise the live theme change.
+          #    (The welcome card from run 1 was never answered, so mark it answered.)
+          (Get-Content $cfg -Raw) -replace '"WelcomeShown":\s*false', '"WelcomeShown": true' | Set-Content $cfg -Encoding utf8
           $p = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 15
           Assert-Running $p "second start"
           Save-Screen "screenshots\full.png"
+          $personalize = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+          $oldLight = (Get-ItemProperty $personalize -Name AppsUseLightTheme -ErrorAction SilentlyContinue).AppsUseLightTheme
+          if ($null -eq $oldLight) { $oldLight = 1 }
+          Add-Type -Namespace Win32 -Name Msg -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam, uint flags, uint timeout, out IntPtr result);'
+          function Set-AppTheme([int]$light) {
+            New-ItemProperty $personalize -Name AppsUseLightTheme -Value $light -PropertyType DWord -Force | Out-Null
+            $r = [IntPtr]::Zero
+            [Win32.Msg]::SendMessageTimeout([IntPtr]0xffff, 0x001A, [IntPtr]::Zero, "ImmersiveColorSet", 2, 5000, [ref]$r) | Out-Null
+          }
+          Set-AppTheme ([int](1 - [int]$oldLight))
+          Start-Sleep -Seconds 8
+          Assert-Running $p "live theme switch"
+          Save-Screen "screenshots\full-theme-switched.png"
+          Set-AppTheme ([int]$oldLight)
+          Start-Sleep -Seconds 17
+          Assert-Running $p "update check"
           Stop-Process -Id $p.Id -Force
           Start-Sleep -Seconds 2
+          $log0 = Get-ChildItem (Join-Path $data "logs") -Filter "pulseram-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not (Select-String -Path $log0.FullName -Pattern "Theme switched" -Quiet)) { Write-Warning "No live theme switch was logged (Windows may not have broadcast the change)" }
+          if (-not (Select-String -Path $log0.FullName -Pattern "Update (check|available)" -Quiet)) { Write-Error "The scheduled update check did not run"; exit 1 }
 
           # 3) Compact widget, with see-through on (the mouse is not over it, so it should fade).
           (Get-Content $cfg -Raw) -replace '"MiniHudSeeThrough":\s*false', '"MiniHudSeeThrough": true' | Set-Content $cfg -Encoding utf8

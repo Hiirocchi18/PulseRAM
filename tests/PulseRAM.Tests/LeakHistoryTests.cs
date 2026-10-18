@@ -78,6 +78,16 @@ namespace PulseRAM.Tests
         }
 
         [Fact]
+        public void Restarted_app_that_leaks_again_is_listed_and_notified()
+        {
+            var h = new LeakHistory();
+            Assert.True(h.Record("app", 150, 900, T0, None));
+            h.Forget("app");                                               // restarted
+            Assert.True(h.Record("app", 150, 400, T0.AddMinutes(4), None)); // the new process leaks too
+            Assert.Equal(1, h.Count);
+        }
+
+        [Fact]
         public void Forget_clears_everything()
         {
             var h = new LeakHistory();
