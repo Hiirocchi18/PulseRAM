@@ -34,7 +34,8 @@ namespace PulseRAM
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern uint GetFinalPathNameByHandleW(SafeFileHandle h, StringBuilder path, uint len, uint flags);
 
-        [StructLayout(LayoutKind.Sequential)]
+        // FILETIME is two DWORDs (4-byte aligned): Pack = 4 keeps the native layout (52 bytes).
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
         private struct BY_HANDLE_FILE_INFORMATION
         {
             public uint FileAttributes;
