@@ -291,6 +291,28 @@ namespace PulseRAM
         private string _procSearchQuery = "";
         private bool _isMiniHud = false;
 
+        // Compact widget (its own small layout, not a shrunk dashboard)
+        private Grid _fullLayout = null!;
+        private Border _miniHudPanel = null!;
+        private ProgressRing _miniRing = null!;
+        private TextBlock _miniPercentText = null!;
+        private TextBlock _miniUsedText = null!;
+        private TextBlock _miniStatusText = null!;
+        private Button _miniCleanBtn = null!;
+        private TextBlock _miniCleanLabel = null!;
+        private DateTime _miniStatusUntil = DateTime.MinValue;
+
+        private DateTime _miniLastPress = DateTime.MinValue;
+
+        [DllImport("user32.dll")]
+        private static extern bool ReleaseCapture();
+
+        [DllImport("user32.dll")]
+        private static extern uint GetDoubleClickTime();
+
+        private const uint WM_NCLBUTTONDOWN = 0x00A1;
+        private const int HTCAPTION = 2;
+
         // 60 FPS Smooth Gauge Interpolation State
         private double _targetPercent = 50.0;
         private double _displayedPercent = 0.0;
@@ -507,6 +529,9 @@ namespace PulseRAM
                 else
                 {
                     ShowMainWindow();
+                    // --compact: open straight into the compact widget (e.g. from a shortcut).
+                    if (_launchArgs.Any(a => string.Equals(a, "--compact", StringComparison.OrdinalIgnoreCase)))
+                        ToggleMiniHudMode();
                 }
 
                 if (!string.IsNullOrEmpty(_hotkeyStatus))
@@ -684,8 +709,19 @@ namespace PulseRAM
         {
             try
             {
-                if (_isMiniHud || !IsWindowVisible(_hwnd) || IsIconic(_hwnd)) return;
+                if (!IsWindowVisible(_hwnd) || IsIconic(_hwnd)) return;
                 var cfg = _engine.Config;
+                if (_isMiniHud)
+                {
+                    var mp = _appWindow.Position;
+                    if (cfg.MiniHudX != mp.X || cfg.MiniHudY != mp.Y)
+                    {
+                        cfg.MiniHudX = mp.X;
+                        cfg.MiniHudY = mp.Y;
+                        _engine.SaveConfig();
+                    }
+                    return;
+                }
                 bool maximized = _appWindow.Presenter is OverlappedPresenter op && op.State == OverlappedPresenterState.Maximized;
                 bool changed = maximized != cfg.WindowMaximized;
                 cfg.WindowMaximized = maximized;
@@ -1338,8 +1374,8 @@ namespace PulseRAM
                 {
                     var mmi = Marshal.PtrToStructure<MINMAXINFO>(lParam);
                     double scale = Math.Max(1.0, GetDpiForWindow(hWnd) / 96.0);
-                    int minW = (int)((_isMiniHud ? 300 : 900) * scale);
-                    int minH = (int)((_isMiniHud ? 400 : 600) * scale);
+                    int minW = (int)((_isMiniHud ? 240 : 900) * scale);
+                    int minH = (int)((_isMiniHud ? 80 : 600) * scale);
                     // Never demand more than the screen has (e.g. 1366×768 at 125%).
                     var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
                     if (GetMonitorInfo(MonitorFromWindow(hWnd, 2 /* MONITOR_DEFAULTTONEAREST */), ref mi))
@@ -1611,26 +1647,30 @@ namespace PulseRAM
 
         private void BuildWinUI3Interface()
         {
-            _rootGrid = new Grid
+            _rootGrid = new Grid { Background = BrushHex("#060A12", 245) };
+            _rootGrid.RequestedTheme = s_lightTheme ? ElementTheme.Light : ElementTheme.Dark;
+
+            _fullLayout = new Grid
             {
-                Background = BrushHex("#060A12", 245),
                 Padding = new Thickness(16, 12, 16, 14),
                 RowSpacing = 12
             };
-            _rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            _rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            _rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            _rootGrid.RequestedTheme = s_lightTheme ? ElementTheme.Light : ElementTheme.Dark;
+            _fullLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            _fullLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            _fullLayout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            _rootGrid.Children.Add(_fullLayout);
+            _miniHudPanel = BuildMiniHudPanel();
+            _rootGrid.Children.Add(_miniHudPanel);
 
             // 1. Top Command Header
             var topBar = BuildTopCommandBar();
             Grid.SetRow(topBar, 0);
-            _rootGrid.Children.Add(topBar);
+            _fullLayout.Children.Add(topBar);
 
             // 1b. Commit-charge warning (hidden until needed)
             _commitBanner = BuildCommitBanner();
             Grid.SetRow(_commitBanner, 1);
-            _rootGrid.Children.Add(_commitBanner);
+            _fullLayout.Children.Add(_commitBanner);
 
             // 2. View Host Container
             var viewHost = new Grid();
@@ -1651,7 +1691,7 @@ namespace PulseRAM
             _toastBanner = BuildToastBanner();
             viewHost.Children.Add(_toastBanner);
 
-            _rootGrid.Children.Add(viewHost);
+            _fullLayout.Children.Add(viewHost);
             Content = _rootGrid;
         }
 
@@ -3256,6 +3296,7 @@ namespace PulseRAM
 
         private void ToggleMiniHudMode()
         {
+            if (!_isMiniHud) SaveWindowPlacement(); // remember the full-size window before shrinking
             _isMiniHud = !_isMiniHud;
             ApplyMiniHudLayout();
 
@@ -3263,31 +3304,236 @@ namespace PulseRAM
             {
                 if (_appWindow.Presenter is OverlappedPresenter presenter)
                 {
+                    if (_isMiniHud && presenter.State == OverlappedPresenterState.Maximized) presenter.Restore();
                     presenter.IsAlwaysOnTop = _isMiniHud;
+                    presenter.IsResizable = !_isMiniHud;
+                    presenter.IsMaximizable = !_isMiniHud;
+                    // A widget has no title bar: it is dragged by its body and has its own two buttons.
+                    presenter.SetBorderAndTitleBar(true, !_isMiniHud);
                 }
                 if (_isMiniHud)
                 {
-                    double scale = Math.Max(1.0, GetDpiForWindow(_hwnd) / 96.0);
-                    _appWindow.Resize(new SizeInt32((int)(430 * scale), (int)(760 * scale)));
+                    PlaceMiniHud();
                 }
                 else
                 {
                     // Back to the user's own size (or a size that fits the screen), never a fixed 1440×930.
                     RestoreWindowPlacement();
+                    if (_engine.Config.WindowMaximized && _appWindow.Presenter is OverlappedPresenter op) op.Maximize();
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Warn("Compact view switch failed", ex);
+            }
+            RefreshAllUi(force: true);
         }
 
-        /// <summary>Element states for Mini HUD on/off (also re-applied after a theme rebuild).</summary>
+        /// <summary>Element states for compact view on/off (also re-applied after a theme rebuild).</summary>
         private void ApplyMiniHudLayout()
         {
-            SwitchView("overview");
-            _rightColumnOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
-            _bottomSplitOverview.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
-            _miniHudBtn.Content = new FontIcon { Glyph = _isMiniHud ? "\uE73F" : "\uE944", FontSize = 13 };
-            ToolTipService.SetToolTip(_miniHudBtn, _isMiniHud ? "Back to full view" : "Compact, always-on-top view");
-            _miniHudBtn.BorderBrush = _isMiniHud ? BrushHex("#10B981") : BrushHex("#94A3B8", 45);
+            _fullLayout.Visibility = _isMiniHud ? Visibility.Collapsed : Visibility.Visible;
+            _miniHudPanel.Visibility = _isMiniHud ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private const int MiniHudWidthDip = 304;
+        private const int MiniHudHeightDip = 104;
+
+        /// <summary>Sizes the widget and puts it where it was last time, or in the top-right corner of this screen.</summary>
+        private void PlaceMiniHud()
+        {
+            double scale = Math.Max(1.0, GetDpiForWindow(_hwnd) / 96.0);
+            var cfg = _engine.Config;
+            DisplayArea? area = null;
+            if (cfg.MiniHudX is int mx && cfg.MiniHudY is int my)
+                area = DisplayArea.GetFromPoint(new PointInt32(mx + 40, my + 20), DisplayAreaFallback.None);
+            if (area != null)
+            {
+                _appWindow.Move(new PointInt32(cfg.MiniHudX!.Value, cfg.MiniHudY!.Value));
+                scale = Math.Max(1.0, GetDpiForWindow(_hwnd) / 96.0); // the target screen may use another scale
+            }
+            else
+            {
+                var wa = (DisplayArea.GetFromWindowId(_appWindow.Id, DisplayAreaFallback.Primary)?.WorkArea) ?? new RectInt32(0, 0, 1280, 720);
+                int margin = (int)(16 * scale);
+                _appWindow.Move(new PointInt32(wa.X + wa.Width - (int)(MiniHudWidthDip * scale) - margin, wa.Y + margin));
+            }
+            _appWindow.ResizeClient(new SizeInt32((int)(MiniHudWidthDip * scale), (int)(MiniHudHeightDip * scale)));
+        }
+
+        private static Button MiniIconButton(string glyph, string tip, Action onClick)
+        {
+            var b = new Button
+            {
+                Content = new FontIcon { Glyph = glyph, FontSize = 11 },
+                Width = 26,
+                Height = 26,
+                Padding = new Thickness(0),
+                CornerRadius = new CornerRadius(7),
+                Background = new SolidColorBrush(Colors.Transparent),
+                BorderThickness = new Thickness(0),
+                Foreground = BrushHex("#94A3B8")
+            };
+            b.Click += (s, e) => onClick();
+            ToolTipService.SetToolTip(b, tip);
+            return b;
+        }
+
+        /// <summary>
+        /// The compact widget: RAM ring, used/total, one status line and one Clean button.
+        /// Drag it anywhere by its body; it stays on top.
+        /// </summary>
+        private Border BuildMiniHudPanel()
+        {
+            var panel = new Border
+            {
+                Background = BrushHex("#0D1424"),
+                Padding = new Thickness(14, 12, 8, 12),
+                Visibility = Visibility.Collapsed
+            };
+
+            var grid = new Grid { ColumnSpacing = 14 };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            // RAM ring with the percentage inside
+            var ringHost = new Grid { Width = 72, Height = 72, VerticalAlignment = VerticalAlignment.Center };
+            _miniRing = new ProgressRing
+            {
+                IsIndeterminate = false,
+                Minimum = 0,
+                Maximum = 100,
+                Value = 0,
+                Width = 72,
+                Height = 72,
+                Foreground = BrushHex("#10B981"),
+                Background = BrushHex("#94A3B8", 40),
+                IsHitTestVisible = false
+            };
+            _miniPercentText = new TextBlock
+            {
+                Text = "–",
+                FontSize = 17,
+                FontWeight = FontWeights.Bold,
+                Foreground = BrushHex("#F8FAFC"),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                IsHitTestVisible = false
+            };
+            ringHost.Children.Add(_miniRing);
+            ringHost.Children.Add(_miniPercentText);
+            Grid.SetColumn(ringHost, 0);
+            grid.Children.Add(ringHost);
+
+            // Used / total, status, Clean
+            var info = new StackPanel { Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
+            _miniUsedText = new TextBlock
+            {
+                Text = "– / – GB",
+                FontSize = 14,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = BrushHex("#F8FAFC"),
+                IsHitTestVisible = false
+            };
+            _miniStatusText = new TextBlock
+            {
+                Text = "",
+                FontSize = 11.5,
+                Foreground = BrushHex("#94A3B8"),
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                IsHitTestVisible = false
+            };
+            _miniCleanLabel = new TextBlock { Text = "Clean", FontSize = 12, FontWeight = FontWeights.SemiBold };
+            var cleanContent = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+            cleanContent.Children.Add(new FontIcon { Glyph = "\uE945", FontSize = 12 });
+            cleanContent.Children.Add(_miniCleanLabel);
+            _miniCleanBtn = new Button
+            {
+                Content = cleanContent,
+                Height = 28,
+                Padding = new Thickness(12, 0, 12, 0),
+                Margin = new Thickness(0, 6, 0, 0),
+                CornerRadius = new CornerRadius(8),
+                Background = BrushHex("#38BDF8", 50),
+                BorderBrush = BrushHex("#38BDF8", 140),
+                BorderThickness = new Thickness(1),
+                Foreground = BrushHex("#F8FAFC")
+            };
+            _miniCleanBtn.Click += (s, e) => RunOptimizationAsync(_selectedMode, "Compact view");
+            info.Children.Add(_miniUsedText);
+            info.Children.Add(_miniStatusText);
+            info.Children.Add(_miniCleanBtn);
+            Grid.SetColumn(info, 1);
+            grid.Children.Add(info);
+
+            // Expand / hide
+            var side = new StackPanel { Spacing = 4, VerticalAlignment = VerticalAlignment.Top };
+            side.Children.Add(MiniIconButton("\uE740", "Full view", ToggleMiniHudMode));
+            side.Children.Add(MiniIconButton("\uE921", "Hide to tray", () => ShowWindow(_hwnd, 0)));
+            Grid.SetColumn(side, 2);
+            grid.Children.Add(side);
+
+            panel.Child = grid;
+
+            // No title bar: drag the widget by its body (buttons handle their own presses).
+            panel.PointerPressed += (s, e) =>
+            {
+                try
+                {
+                    if (!e.GetCurrentPoint(panel).Properties.IsLeftButtonPressed) return;
+                    // The window move loop swallows the second click, so detect a double-click here.
+                    var now = DateTime.Now;
+                    if ((now - _miniLastPress).TotalMilliseconds <= GetDoubleClickTime())
+                    {
+                        _miniLastPress = DateTime.MinValue;
+                        e.Handled = true;
+                        DispatcherQueue.TryEnqueue(ToggleMiniHudMode);
+                        return;
+                    }
+                    _miniLastPress = now;
+                    ReleaseCapture();
+                    SendMessage(_hwnd, WM_NCLBUTTONDOWN, new IntPtr(HTCAPTION), IntPtr.Zero);
+                }
+                catch { }
+            };
+            ToolTipService.SetToolTip(ringHost, "Drag to move · double-click for full view");
+            return panel;
+        }
+
+        private void UpdateMiniHud(MemorySnapshot snap)
+        {
+            string stateHex = snap.PressureLevel == "CRITICAL" ? "#F43F5E"
+                : (snap.PressureLevel == "ELEVATED" ? "#F59E0B" : "#10B981");
+            _miniRing.Value = Math.Clamp(snap.Percent, 0, 100);
+            _miniRing.Foreground = BrushHex(stateHex);
+            _miniPercentText.Text = $"{snap.Percent:F0}%";
+            _miniUsedText.Text = $"{snap.UsedGb:F1} / {snap.TotalGb:F1} GB";
+
+            if (_miniCleanBtn.IsEnabled)
+            {
+                _miniCleanLabel.Text = _selectedMode switch
+                {
+                    "deep" => "Clean · Deep",
+                    "standby" => "Clean · Standby",
+                    "max" => "Clean · Max",
+                    _ => "Clean"
+                };
+            }
+
+            if (DateTime.Now < _miniStatusUntil) return; // a recent result is still showing
+
+            if (snap.CommitLevel != "ok")
+            {
+                _miniStatusText.Text = $"Memory limit {snap.CommitPercent:F0}% used";
+                _miniStatusText.Foreground = BrushHex(snap.CommitLevel == "critical" ? "#F43F5E" : "#F59E0B");
+            }
+            else
+            {
+                string auto = _engine.Config.AutoEnabled ? $"Auto {snap.EffectiveThresholdPercent}%" : "Auto off";
+                _miniStatusText.Text = $"{snap.AvailableGb:F1} GB free · {auto}";
+                _miniStatusText.Foreground = BrushHex("#94A3B8");
+            }
         }
 
         private void ToggleFocusBoost()
@@ -3371,6 +3617,8 @@ namespace PulseRAM
         {
             _optimizeNowBtn.IsEnabled = false;
             _optimizeBtnLabel.Text = "Cleaning…";
+            _miniCleanBtn.IsEnabled = false;
+            _miniCleanLabel.Text = "Cleaning…";
             TriggerReactorShockwaveAnimation();
 
             RunEngineActionAsync(() => _engine.OptimizeMemory(mode, "Manual", reason), ev =>
@@ -3381,7 +3629,9 @@ namespace PulseRAM
             }, "sweep", always: () =>
             {
                 _optimizeNowBtn.IsEnabled = true;
+                _miniCleanBtn.IsEnabled = true;
                 SelectCleaningMode(_selectedMode);
+                if (_isMiniHud) RefreshAllUi(force: true);
             });
         }
 
@@ -3456,6 +3706,14 @@ namespace PulseRAM
 
         private void ShowToast(string title, string sub)
         {
+            if (_isMiniHud)
+            {
+                // The widget has no room for a banner: show the headline on its status line for a few seconds.
+                _miniStatusText.Text = title;
+                _miniStatusText.Foreground = BrushHex("#38BDF8");
+                ToolTipService.SetToolTip(_miniStatusText, sub);
+                _miniStatusUntil = DateTime.Now.AddSeconds(6);
+            }
             _toastTitleText.Text = title;
             _toastSubText.Text = sub;
             _toastBanner.Visibility = Visibility.Visible;
@@ -3557,6 +3815,16 @@ namespace PulseRAM
                 UpdateTrayTooltip(hiddenSnap);
                 SetAnimationsPaused(true);
                 SetSelfEfficiencyMode(_engine.Config.EfficiencyModeWhenHidden);
+                return;
+            }
+            if (_isMiniHud)
+            {
+                // The widget only needs one snapshot; skip the process list and the gauge animation.
+                var miniSnap = _engine.GetSnapshot();
+                UpdateTrayTooltip(miniSnap);
+                SetSelfEfficiencyMode(false);
+                SetAnimationsPaused(true);
+                UpdateMiniHud(miniSnap);
                 return;
             }
             SetAnimationsPaused(_reduceMotion);

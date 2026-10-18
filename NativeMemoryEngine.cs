@@ -207,6 +207,9 @@ namespace PulseRAM
         public int? WindowWidth { get; set; }
         public int? WindowHeight { get; set; }
         public bool WindowMaximized { get; set; }
+        /// <summary>Last position of the compact widget (null = top-right corner).</summary>
+        public int? MiniHudX { get; set; }
+        public int? MiniHudY { get; set; }
         /// <summary>Tier the defaults were tuned for on first run ("low", "mid", "high"; empty = not tuned).</summary>
         public string TunedForTier { get; set; } = "";
     }

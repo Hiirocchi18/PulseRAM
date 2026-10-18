@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.1 — 2026-10-18
+
+### Improved
+- **A real compact view.** The compact button used to shrink the whole dashboard into a tall, clipped window. It is now a small always-on-top widget (about 300×100): a RAM ring with the %, used/total, free memory and Auto-Pilot status, and one *Clean* button for the selected mode. It has no title bar. Drag it by its body, double-click it (or press ⤢) to return to the full view, or hide it to the tray. It remembers where you put it and starts in the top-right corner the first time.
+- While compact, PulseRAM refreshes only the numbers the widget shows (no process list, no gauge animation), so it uses less CPU.
+- New `--compact` launch option opens straight into the widget.
+
 ## v1.3.0 — 2026-10-18
 
 ### New
