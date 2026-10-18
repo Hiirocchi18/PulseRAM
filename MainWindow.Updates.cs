@@ -92,8 +92,7 @@ namespace PulseRAM
         private void OpenUpdatePage()
         {
             string url = _pendingUpdate?.PageUrl ?? $"https://github.com/{UpdateChecker.Repo}/releases/latest";
-            try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
-            catch (Exception ex) { Log.Warn("Could not open the release page", ex); }
+            if (!InstallSecurity.OpenAsUser(url)) Log.Warn("Could not open the release page");
         }
 
         private void ShowUpdateBanner(UpdateInfo info, bool announce)

@@ -621,6 +621,19 @@ namespace PulseRAM
 
         private static bool IsCritical(string name) => CriticalSystemProcesses.Contains(BaseName(name));
 
+        private static readonly int OwnSessionId = Process.GetCurrentProcess().SessionId;
+
+        /// <summary>
+        /// Caps, freezing and Eco only ever touch processes in the user's own desktop session. Settings files can be
+        /// edited by any program the user runs, so an elevated PulseRAM must not let them aim it at services or
+        /// security software (session 0) or other users' sessions.
+        /// </summary>
+        private static bool InUserSession(Process p)
+        {
+            try { return p.SessionId == OwnSessionId && p.SessionId != 0; }
+            catch { return false; }
+        }
+
         private static bool IsUnfreezable(string name) => IsCritical(name) || UnfreezableProcesses.Contains(BaseName(name));
 
         #endregion
@@ -686,6 +699,7 @@ namespace PulseRAM
         {
             try
             {
+                if (!InstallSecurity.IsSafeDataPath(FrozenJournalPath)) return;
                 if (records.Count == 0)
                 {
                     if (File.Exists(FrozenJournalPath)) File.Delete(FrozenJournalPath);
@@ -910,7 +924,7 @@ namespace PulseRAM
                     catch when (path == _configPath)
                     {
                         // Keep a copy of an unreadable user config before defaults overwrite it.
-                        try { File.Copy(_configPath, Path.Combine(DataDirectory, $"pulseram_config.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}.json"), true); } catch { }
+                        try { if (InstallSecurity.IsSafeDataPath(_configPath)) File.Copy(_configPath, Path.Combine(DataDirectory, $"pulseram_config.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}.json"), true); } catch { }
                         loaded = null;
                     }
                 }
@@ -950,6 +964,7 @@ namespace PulseRAM
                 foreach (var app in cfg.EcoApps) _ecoApps.Add(app);
             }
 
+            AuditElevatedStartupTask();
             bool hasElevatedTask = ElevatedStartupTaskExists();
             bool hasRunKey = CheckWindowsStartupRegistry();
             if (hasElevatedTask && hasRunKey)
@@ -1135,6 +1150,11 @@ namespace PulseRAM
                 lock (_saveLock)
                 {
                     Directory.CreateDirectory(DataDirectory);
+                    if (!InstallSecurity.IsSafeDataPath(_configPath))
+                    {
+                        Log.Warn($"Not saving settings: {DataDirectory} is redirected by a link");
+                        return;
+                    }
                     string tmp = _configPath + ".tmp";
                     File.WriteAllText(tmp, json);
                     File.Move(tmp, _configPath, overwrite: true);
@@ -2322,6 +2342,7 @@ namespace PulseRAM
                 {
                     try
                     {
+                        if (!InUserSession(proc)) { refused++; continue; }
                         IntPtr h = OpenProcess(TRIM_ACCESS, false, proc.Id);
                         if (h == IntPtr.Zero) { refused++; continue; }
                         try
@@ -2681,6 +2702,7 @@ namespace PulseRAM
                 {
                     try
                     {
+                        if (!InUserSession(proc)) continue;
                         // QUERY_LIMITED is required for EmptyWorkingSet; without it the trim silently fails.
                         IntPtr hProc = OpenProcess(PROCESS_SUSPEND_RESUME | TRIM_ACCESS, false, proc.Id);
                         if (hProc == IntPtr.Zero) continue;
@@ -2782,6 +2804,7 @@ namespace PulseRAM
             {
                 try
                 {
+                    if (!InUserSession(proc)) continue;
                     IntPtr hProc = OpenProcess(PROCESS_SET_INFORMATION | TRIM_ACCESS, false, proc.Id);
                     if (hProc == IntPtr.Zero) continue;
                     try
@@ -2927,7 +2950,8 @@ namespace PulseRAM
             {
                 if (enable)
                 {
-                    if (_isAdmin && CreateElevatedStartupTask(exePath))
+                    bool protectedLocation = InstallSecurity.IsAdminOnlyWritable(exePath);
+                    if (_isAdmin && protectedLocation && CreateElevatedStartupTask(exePath))
                     {
                         // Remove the Run-key entry: a non-elevated copy launched by it could win the
                         // single-instance race and the elevated one would exit.
@@ -2940,9 +2964,11 @@ namespace PulseRAM
                     SetRunKey(true, exePath);
                     Config.RunOnStartup = true;
                     SaveConfig();
-                    return (true, false, _isAdmin
-                        ? "Registered in HKCU\\...\\Run (could not create the elevated task)."
-                        : "Starts at logon as a standard user. Run PulseRAM as administrator and re-enable to start elevated.");
+                    return (true, false, !_isAdmin
+                        ? "Starts at logon as a standard user. Run PulseRAM as administrator and re-enable to start elevated."
+                        : !protectedLocation
+                            ? "Starts at logon as a standard user. PulseRAM is installed where other programs can change its files, so it won't start itself as administrator. Install it for all users (in Program Files) to allow that."
+                            : "Starts at logon as a standard user (the elevated task could not be created).");
                 }
                 else
                 {
@@ -2995,19 +3021,86 @@ $@"<?xml version=""1.0"" encoding=""UTF-16""?>
   <Actions Context=""Author""><Exec><Command>{SecurityElement.Escape(exePath)}</Command><Arguments>--tray</Arguments></Exec></Actions>
 </Task>";
 
+            // schtasks needs a file. %TEMP% is writable by every program the user runs, so keep the file open
+            // without write/delete sharing while schtasks reads it (nothing can swap its contents), then check
+            // that the registered task runs exactly our EXE.
             string tmp = Path.Combine(Path.GetTempPath(), $"pulseram_task_{Guid.NewGuid():N}.xml");
+            bool created;
             try
             {
-                File.WriteAllText(tmp, xml, Encoding.Unicode);
-                return RunSchtasks($"/Create /F /TN \"{ElevatedStartupTaskName}\" /XML \"{tmp}\"") == 0;
+                using (var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough))
+                {
+                    var bytes = Encoding.Unicode.GetPreamble().Concat(Encoding.Unicode.GetBytes(xml)).ToArray();
+                    fs.Write(bytes, 0, bytes.Length);
+                    fs.Flush(true);
+                    created = RunSchtasks($"/Create /F /TN \"{ElevatedStartupTaskName}\" /XML \"{tmp}\"") == 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("Could not create the elevated startup task", ex);
+                created = false;
             }
             finally
             {
                 try { File.Delete(tmp); } catch { }
             }
+
+            if (!created) return false;
+            string? registered = GetElevatedTaskCommand();
+            if (registered == null || !string.Equals(Path.GetFullPath(registered), Path.GetFullPath(exePath), StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Warn($"Elevated startup task does not run {exePath} (found '{registered}'); removing it");
+                RunSchtasks($"/Delete /TN \"{ElevatedStartupTaskName}\" /F");
+                return false;
+            }
+            return true;
         }
 
-        private static int RunSchtasks(string args)
+        /// <summary>The EXE the elevated startup task runs, or null if there is no task (or it can't be read).</summary>
+        private static string? GetElevatedTaskCommand()
+        {
+            var (code, output) = RunSchtasksWithOutput($"/Query /XML /TN \"{ElevatedStartupTaskName}\"");
+            if (code != 0) return null;
+            var m = System.Text.RegularExpressions.Regex.Match(output, "<Command>(.*?)</Command>", System.Text.RegularExpressions.RegexOptions.Singleline);
+            if (!m.Success) return null;
+            string cmd = System.Net.WebUtility.HtmlDecode(m.Groups[1].Value).Trim().Trim('"');
+            return cmd.Length == 0 ? null : cmd;
+        }
+
+        /// <summary>
+        /// An elevated logon task that runs an EXE from a folder ordinary programs can write to (e.g. an older
+        /// per-user install, a portable copy, or a folder left behind after uninstalling) would let any program
+        /// gain administrator rights at the next logon. Remove it (needs admin); otherwise report it.
+        /// </summary>
+        public bool UnsafeElevatedTaskFound { get; private set; }
+
+        private void AuditElevatedStartupTask()
+        {
+            try
+            {
+                if (!ElevatedStartupTaskExists()) return;
+                string? cmd = GetElevatedTaskCommand();
+                bool safe = cmd != null && File.Exists(cmd) && InstallSecurity.IsAdminOnlyWritable(cmd);
+                if (safe) return;
+                if (_isAdmin && RunSchtasks($"/Delete /TN \"{ElevatedStartupTaskName}\" /F") == 0)
+                {
+                    Log.Warn($"Removed an unsafe elevated startup task (it ran '{cmd}' from a folder other programs can write to)");
+                    Config.RunOnStartup = CheckWindowsStartupRegistry();
+                    return;
+                }
+                UnsafeElevatedTaskFound = true;
+                Log.Warn($"Unsafe elevated startup task found ('{cmd}'); run PulseRAM as administrator once to remove it");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("Could not check the elevated startup task", ex);
+            }
+        }
+
+        private static int RunSchtasks(string args) => RunSchtasksWithOutput(args).Code;
+
+        private static (int Code, string Output) RunSchtasksWithOutput(string args)
         {
             try
             {
@@ -3019,14 +3112,15 @@ $@"<?xml version=""1.0"" encoding=""UTF-16""?>
                     RedirectStandardError = true
                 };
                 using var p = Process.Start(psi);
-                if (p == null) return -1;
-                p.StandardOutput.ReadToEnd();
-                p.StandardError.ReadToEnd();
-                return p.WaitForExit(15000) ? p.ExitCode : -1;
+                if (p == null) return (-1, "");
+                var errTask = p.StandardError.ReadToEndAsync();
+                string output = p.StandardOutput.ReadToEnd();
+                errTask.Wait(15000);
+                return p.WaitForExit(15000) ? (p.ExitCode, output) : (-1, output);
             }
             catch
             {
-                return -1;
+                return (-1, "");
             }
         }
 

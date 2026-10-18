@@ -66,8 +66,10 @@ namespace PulseRAM
                     sb.AppendLine();
 
                     System.IO.Directory.CreateDirectory(Directory);
-                    if (_prunedOn != now.Date) Prune();
                     var file = CurrentFile;
+                    // Elevated: never follow a junction/symlink planted in the (user-writable) log folder.
+                    if (!InstallSecurity.IsSafeDataPath(file)) return;
+                    if (_prunedOn != now.Date) Prune();
                     var fi = new FileInfo(file);
                     if (fi.Exists && fi.Length > MaxFileBytes)
                     {
@@ -117,7 +119,8 @@ namespace PulseRAM
             {
                 System.IO.Directory.CreateDirectory(NativeMemoryEngine.DataDirectory);
                 crashed = File.Exists(RunningMarker);
-                File.WriteAllText(RunningMarker, Environment.ProcessId.ToString());
+                if (InstallSecurity.IsSafeDataPath(RunningMarker))
+                    File.WriteAllText(RunningMarker, Environment.ProcessId.ToString());
             }
             catch { }
             return crashed;
@@ -125,7 +128,7 @@ namespace PulseRAM
 
         public static void MarkSessionEnd()
         {
-            try { if (File.Exists(RunningMarker)) File.Delete(RunningMarker); } catch { }
+            try { if (File.Exists(RunningMarker) && InstallSecurity.IsSafeDataPath(RunningMarker)) File.Delete(RunningMarker); } catch { }
         }
 
         public static void OpenFolder()
@@ -133,7 +136,7 @@ namespace PulseRAM
             try
             {
                 System.IO.Directory.CreateDirectory(Directory);
-                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{Directory}\"") { UseShellExecute = true });
+                InstallSecurity.OpenAsUser(Directory);
             }
             catch { }
         }

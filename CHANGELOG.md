@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.4.1 — 2026-10-18
+
+Security release. Upgrading is recommended for everyone who used "Start with Windows" while running PulseRAM as administrator.
+
+### Security
+- **Fixed: other programs could gain administrator rights through the elevated startup task.**
+  - The "start as administrator at logon" task could point to a PulseRAM copy in your user folder, where any program can replace files. It is now only created for all-users installs in Program Files whose files only administrators can change.
+  - An existing unsafe task is removed the next time PulseRAM runs as administrator; until then PulseRAM shows a warning.
+  - The uninstaller now removes the task too, asking for admin rights if needed.
+- The task definition can no longer be swapped while it is being registered. PulseRAM also checks afterwards that the task runs exactly its own EXE.
+- When elevated, memory caps, freezing and Eco mode only apply to apps in your own session, never to services or security software. Settings files are written by programs running as you, so they're not trusted to aim an elevated PulseRAM elsewhere.
+- When elevated, PulseRAM won't follow junctions or symlinks planted in its data or log folder.
+- When elevated, PulseRAM opens the release page and the log folder through Explorer, so they don't run as administrator.
+- Hardening:
+  - The installer calls system tools by full path.
+  - Build actions are pinned to exact commits, and the Inno Setup version is pinned.
+  - The release tag is passed to scripts as data.
+- Updated the Windows App SDK from 1.6 to 1.8 (security and reliability fixes ship inside the app).
+
+### Other
+- Removed the old manual release script, which contained a local folder path; publishing a release on GitHub now does everything.
+
 ## v1.4.0 — 2026-10-18
 
 ### New

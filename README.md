@@ -153,7 +153,9 @@ Shielded apps, critical system processes and (by default) the foreground app are
 * **Crash log** — errors are written to `%LocalAppData%\PulseRAM\logs` (kept 7 days) instead of being silently ignored, and PulseRAM tells you if the last session ended unexpectedly. *Profiles → Device → Logs* opens the folder.
 
 ### 9. Windows Startup
-* Toggle **Windows Startup** on the dashboard. When PulseRAM is running **as administrator**, startup is registered as an elevated Task Scheduler task (`PulseRAM Elevated Startup`) so Standby/Deep/Max kernel purges keep working after a reboot. Otherwise it uses the per-user `HKCU\...\Run` key and starts as a standard user.
+* Toggle **Windows Startup** on the dashboard. It normally uses the per-user `HKCU\...\Run` key and starts as a standard user.
+* **Starting as administrator at logon** (so Standby/Deep/Max purges work after a reboot) needs an **all-users install** — choose *Install for all users* in the installer, which puts PulseRAM in *Program Files*. Then, with PulseRAM running as administrator, turn on Windows Startup and it registers an elevated Task Scheduler task (`PulseRAM Elevated Startup`).
+  * PulseRAM refuses to do this for per-user or portable copies: their files can be changed by any program you run, so an automatic admin start would let such a program gain administrator rights. Older versions allowed it; PulseRAM 1.4.1 removes such a task the next time it runs as administrator, and the uninstaller removes it too.
 
 ---
 
@@ -226,6 +228,13 @@ Output: `dist\PulseRAM-Setup-v1.4.0.exe` and `dist\PulseRAM-Portable-v1.4.0-x64.
 ## Privacy
 
 PulseRAM collects no telemetry and sends no information about you or your PC anywhere. Its only network request is the optional daily update check: a plain HTTPS request to `api.github.com` for the latest PulseRAM release, which you can turn off in the welcome card or under *Profiles → Device → Updates*.
+
+## Security
+
+* When running as administrator, PulseRAM only caps, freezes or throttles apps in **your own desktop session** — never Windows services or security software — even if its settings file is edited by another program.
+* It won't follow links (junctions/symlinks) planted in its data folder, and opens web pages and folders through Explorer so they don't inherit administrator rights.
+* The automatic "start as administrator" task is only created for all-users installs in Program Files (see *Windows Startup*).
+* Found a security problem? Please report it privately via GitHub's **Security → Report a vulnerability** on this repository instead of opening a public issue.
 
 ## Code signing policy
 

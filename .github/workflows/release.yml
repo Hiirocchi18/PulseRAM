@@ -27,15 +27,17 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: PulseRAM-v*
           path: files
           merge-multiple: true
 
       - name: Check the version matches the tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}   # passed as data, never pasted into the script
         run: |
-          tag="${{ github.event.release.tag_name }}"
+          tag="$TAG"
           ls -la files
           if ! ls files | grep -q "PulseRAM-Setup-v${tag#v}.exe"; then
             echo "::error::The release tag ($tag) doesn't match the version in PulseRAM.csproj. Fix one of them and publish again."
@@ -47,7 +49,9 @@ jobs:
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" files/* --clobber --repo "${{ github.repository }}"
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" files/* --clobber --repo "$REPO"
 
   winget:
     name: Update winget
