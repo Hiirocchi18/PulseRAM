@@ -48,6 +48,8 @@ namespace PulseRAM
                     szInfoTitle = ""
                 };
                 _trayInitialized = Shell_NotifyIcon(NIM_ADD, ref _trayData);
+                if (_trayInitialized) Log.Info("Tray icon added");
+                else Log.Warn($"Tray icon could not be added (error {Marshal.GetLastWin32Error()}); minimize goes to the taskbar");
             }
             catch { }
         }
