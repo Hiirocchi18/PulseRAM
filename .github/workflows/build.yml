@@ -325,6 +325,7 @@ jobs:
           Write-Host "Installed build runs."
           & "$env:SystemRoot\System32\schtasks.exe" /Query /TN "PulseRAM Elevated Startup" 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) { Write-Error "The unsafe elevated startup task was not removed"; exit 1 }
+          $global:LASTEXITCODE = 0   # the query above is expected to fail
           Write-Host "Unsafe elevated startup task was removed"
           $unins = Join-Path $env:LOCALAPPDATA "Programs\PulseRAM\unins000.exe"
           $u = Start-Process -FilePath $unins -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru -Wait
