@@ -63,7 +63,7 @@ jobs:
 
       # Opens a pull request on microsoft/winget-pkgs from your fork. The first version must be submitted by hand
       # (winget/Submit-Winget.ps1); after that, this keeps winget up to date with every release.
-      - uses: vedantmgoyal9/winget-releaser@main
+      - uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54 # v2
         if: env.HAS_TOKEN == 'true'
         with:
           identifier: Hiirocchi18.PulseRAM

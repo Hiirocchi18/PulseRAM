@@ -60,7 +60,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
-Name: "runonstartup"; Description: "Launch PulseRAM minimized in System Tray when Windows starts"; GroupDescription: "Windows Integration:"
+Name: "runonstartup"; Description: "Launch PulseRAM minimized in System Tray when Windows starts"; GroupDescription: "Windows Integration:"; Flags: unchecked
 
 [Files]
 ; User settings are stored in %LocalAppData%\PulseRAM, so never ship a pulseram_config.json from a dev run.

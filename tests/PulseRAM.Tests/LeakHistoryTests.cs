@@ -45,11 +45,46 @@ namespace PulseRAM.Tests
         }
 
         [Fact]
-        public void Dismissed_app_can_notify_again()
+        public void Dismissed_app_stays_hidden_while_it_keeps_leaking()
         {
             var h = new LeakHistory();
             Assert.True(h.Record("app", 150, 900, T0, None));
-            Assert.True(h.Remove("app"));
+            Assert.True(h.Dismiss("app", T0.AddMinutes(1)));
+            for (int m = 2; m < 120; m += 2)          // still leaking every couple of minutes
+                Assert.False(h.Record("app", 150, 900, T0.AddMinutes(m), None));
+            Assert.Equal(0, h.Count);
+        }
+
+        [Fact]
+        public void Dismissed_app_returns_after_a_new_episode()
+        {
+            var h = new LeakHistory();
+            Assert.True(h.Record("app", 150, 900, T0, None));
+            h.Dismiss("app", T0.AddMinutes(1));
+            Assert.False(h.Record("app", 150, 900, T0.AddMinutes(5), None));
+            // quiet for > 10 minutes, then leaking again 2 h later → listed and notified
+            Assert.True(h.Record("app", 150, 900, T0.AddMinutes(125), None));
+            Assert.Equal(1, h.Count);
+        }
+
+        [Fact]
+        public void New_episode_soon_after_dismiss_is_listed_but_not_renotified()
+        {
+            var h = new LeakHistory();
+            Assert.True(h.Record("app", 150, 900, T0, None));
+            h.Dismiss("app", T0.AddMinutes(1));
+            Assert.False(h.Record("app", 150, 900, T0.AddMinutes(20), None)); // new episode, but notified < 1 h ago
+            Assert.Equal(1, h.Count);
+        }
+
+        [Fact]
+        public void Forget_clears_everything()
+        {
+            var h = new LeakHistory();
+            Assert.True(h.Record("app", 150, 900, T0, None));
+            h.Dismiss("app", T0);
+            Assert.False(h.Forget("app"));
+            Assert.False(h.IsDismissed("app"));
             Assert.True(h.Record("app", 150, 900, T0.AddMinutes(1), None));
         }
 

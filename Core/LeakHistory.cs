@@ -29,11 +29,24 @@ namespace PulseRAM.Core
 
         private readonly Dictionary<string, LeakIncident> _byApp = new Dictionary<string, LeakIncident>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _lastNotified = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        // Dismissed apps stay hidden while they keep leaking; they come back only after a fresh episode
+        // (no growth for more than EpisodeGap, then growth again). Value = last time it was seen leaking.
+        private readonly Dictionary<string, DateTime> _dismissed = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>Records a sample of a leaking app. Returns true when the user should be told about it now.</summary>
         public bool Record(string app, double rateMbPerMin, double privateMb, DateTime now, ICollection<string> ignored)
         {
             if (string.IsNullOrWhiteSpace(app) || ignored.Contains(app)) return false;
+
+            if (_dismissed.TryGetValue(app, out var lastDismissedSeen))
+            {
+                if (now - lastDismissedSeen <= EpisodeGap)
+                {
+                    _dismissed[app] = now;
+                    return false;
+                }
+                _dismissed.Remove(app); // it stopped growing for a while and started again: a new episode
+            }
 
             if (_byApp.TryGetValue(app, out var inc))
             {
@@ -72,11 +85,25 @@ namespace PulseRAM.Core
                     LastRateMbPerMin = i.LastRateMbPerMin, PrivateMb = i.PrivateMb, Episodes = i.Episodes
                 }).ToList();
 
-        public bool Remove(string app)
+        /// <summary>
+        /// Hides an app from the list until it starts a new growth episode. It does not notify again within
+        /// <see cref="RenotifyAfter"/> of the last notice either way.
+        /// </summary>
+        public bool Dismiss(string app, DateTime now)
         {
+            _dismissed[app] = now;
+            return _byApp.Remove(app);
+        }
+
+        /// <summary>Forgets an app completely (used when the user chooses Ignore, which also adds it to the ignore list).</summary>
+        public bool Forget(string app)
+        {
+            _dismissed.Remove(app);
             _lastNotified.Remove(app);
             return _byApp.Remove(app);
         }
+
+        public bool IsDismissed(string app) => _dismissed.ContainsKey(app);
 
         public int Count => _byApp.Count;
     }

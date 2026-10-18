@@ -294,14 +294,18 @@ namespace PulseRAM
                 else
                 {
                     ShowMainWindow();
-                    ShowWelcomeIfFirstRun();
-                    // --compact: open straight into the compact widget (e.g. from a shortcut).
+                    // --compact: open straight into the compact widget (e.g. from a shortcut). The welcome card
+                    // waits for a normal launch, since it doesn't fit in the widget.
                     if (_launchArgs.Any(a => string.Equals(a, "--compact", StringComparison.OrdinalIgnoreCase)))
                         ToggleMiniHudMode();
+                    else
+                        ShowWelcomeIfFirstRun();
                 }
 
                 if (!string.IsNullOrEmpty(_hotkeyStatus))
                     ShowToast("Hotkey unavailable", _hotkeyStatus);
+                else if (NativeMemoryEngine.PortableUnavailable)
+                    ShowToast("Portable mode is off", "This folder can't be written to, so settings are kept in %LocalAppData%\\PulseRAM. Move the folder somewhere writable to keep them next to the EXE.");
                 else if (Program.PreviousSessionCrashed)
                     ShowToast("PulseRAM closed unexpectedly last time", "Details are in the log: Profiles → Device → Logs.");
             }

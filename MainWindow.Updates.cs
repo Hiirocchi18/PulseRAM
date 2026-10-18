@@ -114,6 +114,9 @@ namespace PulseRAM
             _updateTimer.IsRepeating = true;
             _updateTimer.Tick += (s, e) =>
             {
+                // Wait for the user's answer on the welcome card (it has the opt-out).
+                if (_welcomeShowing) return;
+                // Every 4 h after a check; after a failed attempt (offline at logon, rate limit) retry in 30 min.
                 _updateTimer.Interval = TimeSpan.FromHours(4);
                 if (UpdateChecker.IsDue(_engine.Config, DateTime.UtcNow)) CheckForUpdates(manual: false);
             };
@@ -126,11 +129,19 @@ namespace PulseRAM
             _updateCheckRunning = true;
             try
             {
-                var info = await UpdateChecker.CheckAsync(_engine.Config, ignoreSkipped: manual);
-                _engine.Config.LastUpdateCheckUtc = DateTime.UtcNow;
-                _engine.SaveConfig();
+                var (answered, info) = await UpdateChecker.CheckAsync(_engine.Config, ignoreSkipped: manual);
+                if (answered)
+                {
+                    _engine.Config.LastUpdateCheckUtc = DateTime.UtcNow;
+                    _engine.SaveConfig();
+                }
+                else if (!manual && _updateTimer != null)
+                {
+                    _updateTimer.Interval = TimeSpan.FromMinutes(30);
+                }
                 if (info != null) ShowUpdateBanner(info, announce: true);
-                else if (manual) ShowToast("You're up to date", $"PulseRAM {UpdateChecker.CurrentVersionText} is the latest release (or GitHub couldn't be reached).");
+                else if (manual) ShowToast(answered ? "You're up to date" : "Couldn't check for updates",
+                    answered ? $"PulseRAM {UpdateChecker.CurrentVersionText} is the latest release." : "GitHub couldn't be reached. Try again later.");
             }
             catch (Exception ex)
             {

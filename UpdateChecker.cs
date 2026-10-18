@@ -43,10 +43,11 @@ namespace PulseRAM
             cfg.CheckForUpdates && (cfg.LastUpdateCheckUtc is not DateTime last || utcNow - last >= TimeSpan.FromHours(24) || last > utcNow);
 
         /// <summary>
-        /// Returns the newer release, or null when up to date, offline, rate-limited or no release exists.
+        /// Info is the newer release, or null when up to date or no release exists. Answered is false when GitHub
+        /// couldn't be asked (offline, timeout, rate limit), so the caller can try again later instead of waiting a day.
         /// Never throws. <paramref name="ignoreSkipped"/> is for a manual "Check now".
         /// </summary>
-        public static async Task<UpdateInfo?> CheckAsync(EngineConfig cfg, bool ignoreSkipped, CancellationToken ct = default)
+        public static async Task<(bool Answered, UpdateInfo? Info)> CheckAsync(EngineConfig cfg, bool ignoreSkipped, CancellationToken ct = default)
         {
             try
             {
@@ -55,10 +56,15 @@ namespace PulseRAM
                 http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 
                 using var resp = await http.GetAsync(LatestApi, ct).ConfigureAwait(false);
+                if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
+                {
+                    Log.Info("Update check: no published release yet");
+                    return (true, null);
+                }
                 if (!resp.IsSuccessStatusCode)
                 {
-                    Log.Info($"Update check: GitHub answered {(int)resp.StatusCode} (no published release yet, or rate-limited)");
-                    return null;
+                    Log.Info($"Update check: GitHub answered {(int)resp.StatusCode}; will try again later");
+                    return (false, null);
                 }
 
                 await using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
@@ -70,27 +76,27 @@ namespace PulseRAM
                 bool draft = root.TryGetProperty("draft", out var d) && d.ValueKind == JsonValueKind.True;
                 bool pre = root.TryGetProperty("prerelease", out var p) && p.ValueKind == JsonValueKind.True;
 
-                if (draft || pre || !VersionInfo.IsNewer(tag, CurrentVersion)) return null;
-                if (!VersionInfo.TryParseTag(tag, out var latest)) return null;
+                if (draft || pre || !VersionInfo.IsNewer(tag, CurrentVersion)) return (true, null);
+                if (!VersionInfo.TryParseTag(tag, out var latest)) return (true, null);
                 string latestText = $"{latest.Major}.{latest.Minor}.{latest.Build}";
-                if (!ignoreSkipped && string.Equals(cfg.SkippedUpdateVersion, latestText, StringComparison.OrdinalIgnoreCase)) return null;
+                if (!ignoreSkipped && string.Equals(cfg.SkippedUpdateVersion, latestText, StringComparison.OrdinalIgnoreCase)) return (true, null);
 
                 // Only ever open this repository's own release page.
                 if (!url.StartsWith(ReleasePagePrefix, StringComparison.OrdinalIgnoreCase))
                     url = ReleasePagePrefix + "latest";
 
                 Log.Info($"Update available: {latestText} (running {CurrentVersionText})");
-                return new UpdateInfo { Version = latestText, PageUrl = url, Title = string.IsNullOrWhiteSpace(name) ? $"PulseRAM {latestText}" : name };
+                return (true, new UpdateInfo { Version = latestText, PageUrl = url, Title = string.IsNullOrWhiteSpace(name) ? $"PulseRAM {latestText}" : name });
             }
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException or OperationCanceledException)
             {
                 Log.Info($"Update check skipped: {ex.GetType().Name}");
-                return null;
+                return (false, null);
             }
             catch (Exception ex)
             {
                 Log.Warn("Update check failed", ex);
-                return null;
+                return (false, null);
             }
         }
     }

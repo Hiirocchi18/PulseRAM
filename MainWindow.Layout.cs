@@ -1628,6 +1628,7 @@ namespace PulseRAM
             };
             opts.Children.Add(chkCommit);
             var chkUpdates = new CheckBox { Content = "Updates", FontSize = 12, MinWidth = 0, IsChecked = _engine.Config.CheckForUpdates };
+            _chkUpdates = chkUpdates;
             ToolTipService.SetToolTip(chkUpdates, "Check GitHub for a new version once a day. It's the only network request PulseRAM makes, and it never downloads anything by itself.");
             chkUpdates.Click += (s, e) =>
             {

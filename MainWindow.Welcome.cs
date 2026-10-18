@@ -10,11 +10,12 @@ namespace PulseRAM
     public sealed partial class MainWindow
     {
         private bool _welcomeShowing;
+        private CheckBox? _chkUpdates; // the Settings checkbox, kept in sync with the welcome card
 
         /// <summary>Shown once, on the first launch with no saved settings (never for upgrades or --tray starts).</summary>
         private async void ShowWelcomeIfFirstRun()
         {
-            if (!_engine.IsFirstRun || _engine.Config.WelcomeShown || _welcomeShowing) return;
+            if (!_engine.IsFirstRun || _engine.Config.WelcomeShown || _welcomeShowing || _isMiniHud) return;
             _welcomeShowing = true;
             try
             {
@@ -60,6 +61,7 @@ namespace PulseRAM
                 cfg.WelcomeShown = true;
                 cfg.CheckForUpdates = chkUpdates.IsChecked == true;
                 _engine.SaveConfig();
+                if (_chkUpdates != null) _chkUpdates.IsChecked = cfg.CheckForUpdates;
                 if ((chkStartup.IsChecked == true) != _engine.IsStartupEnabled())
                     _swStartup.IsOn = chkStartup.IsChecked == true; // the switch's handler registers startup
                 if (result == ContentDialogResult.Secondary && !_isMiniHud) ToggleMiniHudMode();

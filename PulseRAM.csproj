@@ -31,17 +31,27 @@
 
   <!--
     Smaller download: ship English resources only (PulseRAM's UI is English) and let the trimmer drop the parts of
-    the .NET libraries PulseRAM never calls. TrimMode=partial only trims framework assemblies that are marked
-    trimmable; PulseRAM's own code and the Windows App SDK projections are kept whole. Settings are read with
-    System.Text.Json reflection, so keep that enabled.
+    the .NET and Windows SDK libraries PulseRAM never calls (installer 45.6 MB → ~23 MB). TrimMode=partial only
+    trims assemblies marked trimmable; PulseRAM's own code is kept whole, and the WinUI/WinRT projections are rooted
+    below because XAML reaches them through metadata the trimmer can't see (trimming them crashes at startup).
+    Settings are read with System.Text.Json reflection, so keep that enabled.
   -->
   <PropertyGroup>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <PublishTrimmed Condition="'$(PulseRamTrim)' == 'true'">true</PublishTrimmed>
+    <PublishTrimmed>true</PublishTrimmed>
     <TrimMode>partial</TrimMode>
     <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
     <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WinUI/WinRT projections are used through XAML metadata and COM activation the trimmer can't see. -->
+    <TrimmerRootAssembly Include="Microsoft.WinUI" />
+    <TrimmerRootAssembly Include="WinRT.Runtime" />
+    <TrimmerRootAssembly Include="Microsoft.InteractiveExperiences.Projection" />
+    <TrimmerRootAssembly Include="Microsoft.WindowsAppRuntime.Bootstrap.Net" />
+    <TrimmerRootAssembly Include="Microsoft.Windows.ApplicationModel.WindowsAppRuntime.Projection" />
+  </ItemGroup>
 
   <ItemGroup>
     <None Remove="portable.txt" />

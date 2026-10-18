@@ -146,7 +146,8 @@ jobs:
           Stop-Process -Id $p.Id -Force
           Start-Sleep -Seconds 2
 
-          # 2) Second run: no welcome card.
+          # 2) Second run: no welcome card; dark theme to exercise the other palette.
+          (Get-Content $cfg -Raw) -replace '"Theme":\s*"system"', '"Theme": "dark"' | Set-Content $cfg -Encoding utf8
           $p = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 15
           Assert-Running $p "second start"
