@@ -18,7 +18,7 @@ if (-not $token) {
 }
 
 $repo = "Hiirocchi18/PulseRAM"
-$version = "1.3.0"
+$version = "1.3.1"
 $installerPath = "$PSScriptRoot\dist\PulseRAM-Setup-v$version.exe"
 
 if (-not (Test-Path $installerPath)) {
