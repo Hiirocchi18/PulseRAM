@@ -66,7 +66,22 @@ namespace PulseRAM
                 tb.ButtonHoverForegroundColor = fg;
             }
             catch { }
+            try
+            {
+                // Also tell DWM, and redraw the frame: on a live theme switch the title bar otherwise keeps
+                // the old colours until the window is re-activated.
+                int dark = s_lightTheme ? 0 : 1;
+                DwmSetWindowAttribute(_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, ref dark, sizeof(int));
+                SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020 /* NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED */);
+            }
+            catch { }
         }
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
 
         /// <summary>Switches light/dark by rebuilding the (code-built) interface with the other palette.</summary>
         private void ApplyTheme()
