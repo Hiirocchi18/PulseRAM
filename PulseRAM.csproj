@@ -37,7 +37,7 @@
   -->
   <PropertyGroup>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <PublishTrimmed>true</PublishTrimmed>
+    <PublishTrimmed Condition="'$(PulseRamTrim)' == 'true'">true</PublishTrimmed>
     <TrimMode>partial</TrimMode>
     <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
     <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>

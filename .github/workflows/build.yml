@@ -129,6 +129,8 @@ jobs:
               Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-3) } -ErrorAction SilentlyContinue |
                 Where-Object { $_.ProviderName -in @('Application Error', '.NET Runtime', 'Windows Error Reporting') } |
                 Select-Object -First 5 | Format-List TimeCreated, ProviderName, Message
+              $l = Get-ChildItem (Join-Path $data "logs") -Filter "pulseram-*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+              if ($l) { "== PulseRAM log =="; Get-Content $l.FullName -Tail 60 }
               Write-Error "PulseRAM exited during $what (exit code $($p.ExitCode))."
               exit 1
             }
