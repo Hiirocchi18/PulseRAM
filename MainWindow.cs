@@ -310,6 +310,8 @@ namespace PulseRAM
 
                 if (!string.IsNullOrEmpty(_hotkeyStatus))
                     ShowToast("Hotkey unavailable", _hotkeyStatus);
+                else if (_engine.UnsafeElevatedTaskFound)
+                    ShowToast("Unsafe startup task found", "An old 'start as administrator' task points to a folder other programs can change. Click Admin once and PulseRAM removes it.");
                 else if (NativeMemoryEngine.PortableUnavailable)
                     ShowToast("Portable mode is off", "This folder can't be written to, so settings are kept in %LocalAppData%\\PulseRAM. Move the folder somewhere writable to keep them next to the EXE.");
                 else if (Program.PreviousSessionCrashed)

@@ -57,7 +57,7 @@ namespace PulseRAM
             ToolTipService.SetToolTip(_commitBannerFixBtn, "Opens Performance Options → Advanced → Virtual memory.");
             _commitBannerFixBtn.Click += (s, e) =>
             {
-                try { Process.Start(new ProcessStartInfo("SystemPropertiesPerformance.exe") { UseShellExecute = true }); }
+                try { Process.Start(new ProcessStartInfo(System.IO.Path.Combine(Environment.SystemDirectory, "SystemPropertiesPerformance.exe")) { UseShellExecute = true }); }
                 catch (Exception ex) { Log.Warn("Could not open page-file settings", ex); }
             };
             Grid.SetColumn(_commitBannerFixBtn, 2);

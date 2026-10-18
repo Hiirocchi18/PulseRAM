@@ -37,6 +37,9 @@ namespace PulseRAM
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool AllowSetForegroundWindow(int dwProcessId);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SetDllDirectory(string lpPathName);
+
         private const int ASFW_ANY = -1;
 
         private static bool HasArg(string[] args, string name) =>
@@ -64,6 +67,14 @@ namespace PulseRAM
         public static void Main(string[] args)
         {
             args ??= Array.Empty<string>();
+            // Elevated: ignore junctions planted by non-admin programs (Windows 11 22H2+), and take the current
+            // directory out of the DLL search order. (Restricting the search further with SetDefaultDllDirectories
+            // breaks WinUI's own loading, so it isn't used.)
+            SafeFile.EnableRedirectionGuard();
+            if (InstallSecurity.IsElevated)
+            {
+                try { SetDllDirectory(""); } catch { }
+            }
 
             // Used by the installer before upgrading/uninstalling: resume anything PulseRAM suspended.
             if (HasArg(args, "--thaw-frozen"))

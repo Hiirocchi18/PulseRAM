@@ -6,7 +6,7 @@
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>PulseRAM</RootNamespace>
     <AssemblyName>PulseRAM</AssemblyName>
-    <Version>1.4.0</Version>
+    <Version>1.4.1</Version>
     <Company>Hiirocchi18</Company>
     <Product>PulseRAM</Product>
     <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -70,13 +70,33 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
-    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250108002" />
+    <!--
+      Windows App SDK 1.8, without the all-in-one "Microsoft.WindowsAppSDK" package: that one also bundles the
+      Windows AI / machine-learning runtimes and Widgets (~13 MB more in the installer), which PulseRAM never uses.
+      WinUI brings Foundation, InteractiveExperiences and Base; DWrite is the text renderer.
+    -->
+    <PackageReference Include="Microsoft.WindowsAppSDK.WinUI" Version="1.8.260803003" />
+    <PackageReference Include="Microsoft.WindowsAppSDK.DWrite" Version="1.8.25122902" />
+    <PackageReference Include="Microsoft.WindowsAppSDK.Runtime" Version="1.8.260921001" />
   </ItemGroup>
   <!--
     Unpackaged WinUI apps load their merged resource index from resources.pri next to the EXE.
     When PRI generation is enabled (release builds: -p:EnableCoreMrtTooling=true -p:AppxGeneratePriEnabled=true),
     publish does not copy the generated $(TargetName).pri, so copy it as resources.pri.
   -->
+  <!--
+    The Windows App SDK runtime package also carries the on-device AI / machine-learning engines (ONNX Runtime,
+    DirectML, ~38 MB), the Widgets host and a debugging-only symbol reader. PulseRAM uses none of them; they only
+    load if an app calls those APIs, so leave them out of the published app.
+  -->
+  <Target Name="PulseRamDropUnusedRuntimeFiles" AfterTargets="Publish">
+    <ItemGroup>
+      <PulseRamUnused Include="$(PublishDir)onnxruntime*.dll;$(PublishDir)Microsoft.ML.OnnxRuntime*.dll;$(PublishDir)DirectML*.dll;$(PublishDir)Microsoft.Windows.AI*.dll;$(PublishDir)Microsoft.Windows.Widgets*.dll;$(PublishDir)Microsoft.DiaSymReader.Native.*.dll" />
+    </ItemGroup>
+    <Delete Files="@(PulseRamUnused)" />
+    <Message Importance="high" Text="PulseRAM: removed unused runtime files: @(PulseRamUnused->'%(Filename)%(Extension)', ', ')" />
+  </Target>
+
   <Target Name="PulseRamCopyResourcesPri" AfterTargets="Publish" Condition="'$(ProjectPriFullPath)' != '' and Exists('$(ProjectPriFullPath)')">
     <Copy SourceFiles="$(ProjectPriFullPath)" DestinationFiles="$(PublishDir)resources.pri" />
     <Message Importance="high" Text="PulseRAM: copied $(ProjectPriFullPath) -> $(PublishDir)resources.pri" />

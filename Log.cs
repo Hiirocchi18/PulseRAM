@@ -67,14 +67,13 @@ namespace PulseRAM
 
                     System.IO.Directory.CreateDirectory(Directory);
                     if (_prunedOn != now.Date) Prune();
+                    // Roll to pulseram-yyyyMMdd-1.log, -2 … when a file passes 2 MB (no renames: an elevated rename in
+                    // this user-writable folder could be redirected).
                     var file = CurrentFile;
-                    var fi = new FileInfo(file);
-                    if (fi.Exists && fi.Length > MaxFileBytes)
-                    {
-                        File.Move(file, Path.Combine(Directory, $"pulseram-{DateTime.Now:yyyyMMdd-HHmmss}.log"), true);
-                        Prune(); // enforce the folder cap as files roll
-                    }
-                    File.AppendAllText(file, sb.ToString(), Encoding.UTF8);
+                    for (int part = 1; part <= 20 && new FileInfo(file).Exists && new FileInfo(file).Length > MaxFileBytes; part++)
+                        file = Path.Combine(Directory, $"pulseram-{now:yyyyMMdd}-{part}.log");
+                    if (file != CurrentFile && !File.Exists(file)) Prune(); // enforce the folder cap as files roll
+                    SafeFile.WriteAllText(file, sb.ToString(), append: true);
                 }
             }
             catch
@@ -93,7 +92,7 @@ namespace PulseRAM
                 var files = new DirectoryInfo(Directory).GetFiles("pulseram-*.log").OrderBy(f => f.LastWriteTime).ToList();
                 foreach (var f in files.Where(f => f.LastWriteTime < cutoff).ToList())
                 {
-                    f.Delete();
+                    SafeFile.Delete(f.FullName);
                     files.Remove(f);
                 }
                 long total = files.Sum(f => f.Length);
@@ -101,7 +100,7 @@ namespace PulseRAM
                 {
                     if (total <= MaxFolderBytes) break;
                     total -= f.Length;
-                    f.Delete();
+                    SafeFile.Delete(f.FullName);
                 }
             }
             catch { }
@@ -117,7 +116,7 @@ namespace PulseRAM
             {
                 System.IO.Directory.CreateDirectory(NativeMemoryEngine.DataDirectory);
                 crashed = File.Exists(RunningMarker);
-                File.WriteAllText(RunningMarker, Environment.ProcessId.ToString());
+                SafeFile.WriteAllText(RunningMarker, Environment.ProcessId.ToString());
             }
             catch { }
             return crashed;
@@ -125,7 +124,7 @@ namespace PulseRAM
 
         public static void MarkSessionEnd()
         {
-            try { if (File.Exists(RunningMarker)) File.Delete(RunningMarker); } catch { }
+            try { SafeFile.Delete(RunningMarker); } catch { }
         }
 
         public static void OpenFolder()
@@ -133,7 +132,7 @@ namespace PulseRAM
             try
             {
                 System.IO.Directory.CreateDirectory(Directory);
-                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{Directory}\"") { UseShellExecute = true });
+                InstallSecurity.OpenAsUser(Directory);
             }
             catch { }
         }

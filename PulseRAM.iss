@@ -4,7 +4,7 @@
 ; -----------------------------------------------------------------------------
 
 #define MyAppName "PulseRAM"
-#define MyAppVersion "1.4.0"
+#define MyAppVersion "1.4.1"
 ; Build for another CPU with:  ISCC /DMyArch=arm64 /DPublishDir=publish_arm64 PulseRAM.iss
 #ifndef MyArch
   #define MyArch "x64"
@@ -80,10 +80,6 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
-[UninstallRun]
-; Remove the optional elevated logon task created by "Windows Startup" when PulseRAM ran as administrator.
-; Fails harmlessly if it does not exist or the uninstaller is not elevated.
-Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""PulseRAM Elevated Startup"" /F"; Flags: runhidden; RunOnceId: "DeleteElevatedStartupTask"
 
 [UninstallDelete]
 Type: files; Name: "{localappdata}\PulseRAM\frozen_processes.json"
@@ -125,17 +121,46 @@ begin
     Exec(ExePath, '--thaw-frozen', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
   // 3) Last resort for older versions / hung instances.
-  Exec('taskkill.exe', '/f /im PulseRAM.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im PulseRAM.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+
+
+// The optional "start as administrator" logon task was created by an elevated PulseRAM, so removing it needs
+// admin rights. Leaving it behind would point an elevated task at a folder anyone could later fill, so if it
+// exists, delete it - asking for elevation (one UAC prompt) when this uninstaller isn't elevated.
+procedure RemoveElevatedStartupTask();
+var
+  ResultCode: Integer;
+  SchTasks: String;
+  Ok: Boolean;
+begin
+  SchTasks := ExpandConstant('{sys}\schtasks.exe');
+  if not Exec(SchTasks, '/Query /TN "PulseRAM Elevated Startup"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then exit;
+  if ResultCode <> 0 then exit; // no task
+  if IsAdmin then
+    Ok := Exec(SchTasks, '/Delete /TN "PulseRAM Elevated Startup" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+  else
+    Ok := ShellExec('runas', SchTasks, '/Delete /TN "PulseRAM Elevated Startup" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if (not Ok) or (ResultCode <> 0) then
+    SuppressibleMsgBox('PulseRAM''s "start as administrator" task could not be removed. Open Task Scheduler as administrator and delete "PulseRAM Elevated Startup".', mbInformation, MB_OK, IDOK);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   ThawFrozenAppsAndStopPulseRAM();
+  // A per-user install can never safely be started elevated: if an older version created that task,
+  // remove it now rather than waiting for the app to do it the next time it runs as administrator.
+  if not IsAdminInstallMode then
+    RemoveElevatedStartupTask();
   Result := '';
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
+  begin
     ThawFrozenAppsAndStopPulseRAM();
+    RemoveElevatedStartupTask();
+  end;
 end;

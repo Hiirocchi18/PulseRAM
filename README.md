@@ -7,7 +7,7 @@
 ![Runtime](https://img.shields.io/badge/Runtime-.NET%2010%20(Self--Contained)-512BD4?logo=dotnet)
 ![Architecture](https://img.shields.io/badge/Architecture-x64%20%7C%20ARM64-00599C)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-1.4.0-38BDF8)
+![Version](https://img.shields.io/badge/Version-1.4.1-38BDF8)
 
 <p align="center">
   <img src="docs/screenshot-full.png" alt="PulseRAM dashboard" width="760"><br>
@@ -23,8 +23,8 @@ From the [Releases page](https://github.com/Hiirocchi18/PulseRAM/releases/latest
 
 | Your PC | Installer | Or portable (no install) |
 |---|---|---|
-| Most PCs (Intel / AMD) | `PulseRAM-Setup-v1.4.0.exe` (~23 MB) | `PulseRAM-Portable-v1.4.0-x64.zip` |
-| Windows on ARM (Snapdragon, Surface Pro X …) | `PulseRAM-Setup-v1.4.0-arm64.exe` (~22.5 MB) | `PulseRAM-Portable-v1.4.0-arm64.zip` |
+| Most PCs (Intel / AMD) | `PulseRAM-Setup-v1.4.1.exe` (~22 MB) | `PulseRAM-Portable-v1.4.1-x64.zip` |
+| Windows on ARM (Snapdragon, Surface Pro X …) | `PulseRAM-Setup-v1.4.1-arm64.exe` (~21 MB) | `PulseRAM-Portable-v1.4.1-arm64.zip` |
 
 Or with winget (once the listing is approved): `winget install PulseRAM`
 
@@ -41,8 +41,8 @@ Requirements: Windows 10 (1809 or newer) or Windows 11, 64-bit. Nothing else to 
 
 The download didn't arrive intact — the installer checks itself and refuses to run if even one byte is missing or changed. The file on GitHub is fine.
 
-* Check the size: right-click the file → **Properties**. It should match the size shown on the Releases page (about 23 MB for `PulseRAM-Setup-v1.4.0.exe`); smaller means the download was cut off. Download it again and let it finish.
-* Or check the SHA-256 in PowerShell: `Get-FileHash .\PulseRAM-Setup-v1.4.0.exe` must match the line in `SHA256SUMS.txt` on the release.
+* Check the size: right-click the file → **Properties**. It should match the size shown on the Releases page (about 22 MB for `PulseRAM-Setup-v1.4.1.exe`); smaller means the download was cut off. Download it again and let it finish.
+* Or check the SHA-256 in PowerShell: `Get-FileHash .\PulseRAM-Setup-v1.4.1.exe` must match the line in `SHA256SUMS.txt` on the release.
 * If the size is right but it still fails, antivirus has probably changed or locked the file. Restore it from quarantine / allow it, move it to a normal folder such as *Documents*, right-click → **Properties → Unblock**, and run it again.
 * Don't run it from inside a zip, a cloud-sync folder that is still syncing, or a messaging app's preview. The portable zip is a good fallback.
 </details>
@@ -153,7 +153,9 @@ Shielded apps, critical system processes and (by default) the foreground app are
 * **Crash log** — errors are written to `%LocalAppData%\PulseRAM\logs` (kept 7 days) instead of being silently ignored, and PulseRAM tells you if the last session ended unexpectedly. *Profiles → Device → Logs* opens the folder.
 
 ### 9. Windows Startup
-* Toggle **Windows Startup** on the dashboard. When PulseRAM is running **as administrator**, startup is registered as an elevated Task Scheduler task (`PulseRAM Elevated Startup`) so Standby/Deep/Max kernel purges keep working after a reboot. Otherwise it uses the per-user `HKCU\...\Run` key and starts as a standard user.
+* Toggle **Windows Startup** on the dashboard. It normally uses the per-user `HKCU\...\Run` key and starts as a standard user.
+* **Starting as administrator at logon** (so Standby/Deep/Max purges work after a reboot) needs an **all-users install** — choose *Install for all users* in the installer, which puts PulseRAM in *Program Files*. Then, with PulseRAM running as administrator, turn on Windows Startup and it registers an elevated Task Scheduler task (`PulseRAM Elevated Startup`).
+  * PulseRAM refuses to do this for per-user or portable copies: their files can be changed by any program you run, so an automatic admin start would let such a program gain administrator rights. Older versions allowed it; PulseRAM 1.4.1 removes such a task the next time it runs as administrator, and the uninstaller removes it too.
 
 ---
 
@@ -213,7 +215,7 @@ dotnet build -c Release -r win-x64
 dotnet test tests/PulseRAM.Tests/PulseRAM.Tests.csproj
 ```
 
-Output: `dist\PulseRAM-Setup-v1.4.0.exe` and `dist\PulseRAM-Portable-v1.4.0-x64.zip` (`-arm64` for ARM).
+Output: `dist\PulseRAM-Setup-v1.4.1.exe` and `dist\PulseRAM-Portable-v1.4.1-x64.zip` (`-arm64` for ARM).
 
 **Code layout:** `NativeMemoryEngine.cs` (memory engine), `Core/` (pure decision logic — tiers, purge policy, commit warning, back-off, hotkeys, versions, leak history — covered by `tests/`), `MainWindow.*.cs` (UI, one file per area), `UpdateChecker.cs`, `Log.cs`.
 
@@ -226,6 +228,13 @@ Output: `dist\PulseRAM-Setup-v1.4.0.exe` and `dist\PulseRAM-Portable-v1.4.0-x64.
 ## Privacy
 
 PulseRAM collects no telemetry and sends no information about you or your PC anywhere. Its only network request is the optional daily update check: a plain HTTPS request to `api.github.com` for the latest PulseRAM release, which you can turn off in the welcome card or under *Profiles → Device → Updates*.
+
+## Security
+
+* When running as administrator, PulseRAM only caps, freezes or throttles apps in **your own desktop session** — never Windows services or security software — even if its settings file is edited by another program.
+* It won't follow links (junctions/symlinks) planted in its data folder, and opens web pages and folders through Explorer so they don't inherit administrator rights.
+* The automatic "start as administrator" task is only created for all-users installs in Program Files (see *Windows Startup*).
+* Found a security problem? Please report it privately via GitHub's **Security → Report a vulnerability** on this repository instead of opening a public issue.
 
 ## Code signing policy
 
