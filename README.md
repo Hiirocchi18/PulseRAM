@@ -158,7 +158,7 @@ dotnet build -c Release -r win-x64
 .\Build-Installer.ps1
 ```
 
-The compiled single-file installer will be located in `dist\PulseRAM-Setup-v1.3.0.exe`.
+The compiled single-file installer will be located in `dist\PulseRAM-Setup-v1.3.1.exe`.
 
 Every push is also built on GitHub Actions (`.github/workflows/build.yml`): publish, resource check, a launch smoke test, the Inno Setup installer, and a silent install → launch → uninstall test. The installer is attached to the run as an artifact.
 

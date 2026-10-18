@@ -92,10 +92,30 @@ jobs:
           if (Select-String -Path $log.FullName -Pattern " ERROR " -Quiet) { Write-Error "Errors were logged during startup"; exit 1 }
           Write-Host "PulseRAM is running; config written:"
           Get-Content $cfg -TotalCount 12
+          # Screenshots of the full view and the compact widget for review.
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          function Save-Screen($path) {
+            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+            $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+          }
+          New-Item -ItemType Directory -Force screenshots | Out-Null
+          try { Save-Screen "screenshots\full.png" } catch { Write-Host "Screenshot failed: $_" }
+          Stop-Process -Id $p.Id -Force
+          Start-Sleep -Seconds 2
+          $c = Start-Process -FilePath "publish_selfcontained\PulseRAM.exe" -ArgumentList "--compact" -PassThru
+          Start-Sleep -Seconds 15
+          $c.Refresh()
+          if ($c.HasExited) { Write-Error "PulseRAM exited in compact view (exit code $($c.ExitCode))"; exit 1 }
+          try { Save-Screen "screenshots\compact.png" } catch { Write-Host "Screenshot failed: $_" }
+          Stop-Process -Id $c.Id -Force
+          if (Select-String -Path $log.FullName -Pattern " ERROR " -Quiet) { Write-Error "Errors were logged in compact view"; exit 1 }
           # Exercise the installer's thaw entry point too.
           $t = Start-Process -FilePath "publish_selfcontained\PulseRAM.exe" -ArgumentList "--thaw-frozen" -PassThru -Wait
           Write-Host "--thaw-frozen exit code: $($t.ExitCode)"
-          Stop-Process -Id $p.Id -Force
 
       - name: Build installer (Inno Setup)
         shell: pwsh
@@ -129,6 +149,13 @@ jobs:
           Write-Host "Uninstaller exit code: $($u.ExitCode)"
           Start-Sleep -Seconds 3
           if (Get-Process -Name PulseRAM -ErrorAction SilentlyContinue) { Write-Error "PulseRAM still running after uninstall"; exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: screenshots/
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:
