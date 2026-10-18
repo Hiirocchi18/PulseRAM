@@ -1,0 +1,7 @@
+PulseRAM portable
+
+This file tells PulseRAM to keep its settings, logs and frozen-app journal in the "data" folder
+next to PulseRAM.exe instead of %LocalAppData%\PulseRAM. Delete it to use the normal location.
+
+Nothing is written to the registry, except the optional "Start with Windows" entry (turn it off
+before deleting the folder).

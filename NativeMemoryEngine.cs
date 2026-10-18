@@ -10,6 +10,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using Microsoft.Win32;
+using PulseRAM.Core;
 
 namespace PulseRAM
 {
@@ -147,7 +148,7 @@ namespace PulseRAM
 
     public class EngineConfig
     {
-        public const int CurrentVersion = 2;
+        public const int CurrentVersion = 3;
         public const string DefaultHotkeyPrimary = "Ctrl+Alt+Shift+M";
         public const string DefaultHotkeySecondary = "Ctrl+Alt+Shift+P";
 
@@ -170,6 +171,8 @@ namespace PulseRAM
         public bool AutoLeakRemediation { get; set; } = true;
         public double LeakVelocityThresholdMbMin { get; set; } = 120.0;
         public int LeakGuardCooldownSeconds { get; set; } = 300;
+        /// <summary>Apps the user chose to stop hearing about in the leak list.</summary>
+        public List<string> LeakIgnoredApps { get; set; } = new List<string>();
         public int CapGuardCooldownSeconds { get; set; } = 60;
         public bool ScheduledTrimEnabled { get; set; } = false;
         public int ScheduledIntervalMinutes { get; set; } = 15;
@@ -207,6 +210,18 @@ namespace PulseRAM
         public int? WindowWidth { get; set; }
         public int? WindowHeight { get; set; }
         public bool WindowMaximized { get; set; }
+        /// <summary>Check GitHub Releases for a newer version, at most once a day. The only network request PulseRAM makes.</summary>
+        public bool CheckForUpdates { get; set; } = true;
+        public DateTime? LastUpdateCheckUtc { get; set; }
+        /// <summary>A version the user chose to skip ("1.4.1"); not offered again.</summary>
+        public string SkippedUpdateVersion { get; set; } = "";
+        public bool WelcomeShown { get; set; }
+        /// <summary>The window's minimize button hides PulseRAM to the tray instead of the taskbar.</summary>
+        public bool MinimizeToTray { get; set; } = true;
+        /// <summary>The one-time "still running in the tray" notice has been shown.</summary>
+        public bool TrayHintShown { get; set; }
+        /// <summary>Compact widget becomes see-through while the mouse isn't over it.</summary>
+        public bool MiniHudSeeThrough { get; set; }
         /// <summary>Last position of the compact widget (null = top-right corner).</summary>
         public int? MiniHudX { get; set; }
         public int? MiniHudY { get; set; }
@@ -619,8 +634,38 @@ namespace PulseRAM
             public long StartTicksUtc { get; set; }
         }
 
-        public static string DataDirectory =>
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PulseRAM");
+        /// <summary>
+        /// Portable mode: a file named portable.txt next to PulseRAM.exe keeps all settings, logs and the frozen journal
+        /// in a "data" folder beside the EXE instead of %LocalAppData%\PulseRAM.
+        /// </summary>
+        public static bool IsPortable { get; } = DetectPortable();
+
+        private static bool DetectPortable()
+        {
+            try
+            {
+                if (!File.Exists(Path.Combine(AppContext.BaseDirectory, "portable.txt"))) return false;
+                // Only if the folder is writable (e.g. not unpacked into Program Files); otherwise use %LocalAppData%.
+                string dir = Path.Combine(AppContext.BaseDirectory, "data");
+                Directory.CreateDirectory(dir);
+                string probe = Path.Combine(dir, ".write-test");
+                File.WriteAllText(probe, "");
+                File.Delete(probe);
+                return true;
+            }
+            catch
+            {
+                PortableUnavailable = true;
+                return false;
+            }
+        }
+
+        /// <summary>portable.txt is present but its folder can't be written, so settings went to %LocalAppData%.</summary>
+        public static bool PortableUnavailable { get; private set; }
+
+        public static string DataDirectory => IsPortable
+            ? Path.Combine(AppContext.BaseDirectory, "data")
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PulseRAM");
 
         private static string FrozenJournalPath => Path.Combine(DataDirectory, "frozen_processes.json");
 
@@ -706,6 +751,10 @@ namespace PulseRAM
         private HashSet<string> _profileShields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _lastCapAction = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _lastLeakAction = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private readonly LeakHistory _leakHistory = new LeakHistory();
+
+        /// <summary>Raised (on a background thread) the first time an app is seen leaking, then at most hourly per app.</summary>
+        public event Action<LeakIncident>? OnLeakDetected;
 
         private readonly Dictionary<int, (DateTime Time, TimeSpan CpuTime)> _procCpuSamples = new Dictionary<int, (DateTime, TimeSpan)>();
         private volatile Dictionary<int, double> _lastPidCpu = new Dictionary<int, double>();
@@ -835,6 +884,9 @@ namespace PulseRAM
 
         #region Configuration
 
+        /// <summary>True until the welcome card has been shown once on this install (upgrades from 1.3 count as shown).</summary>
+        public bool IsFirstRun { get; private set; }
+
         public void LoadConfig()
         {
             bool loadedFromSeed = false;
@@ -879,12 +931,15 @@ namespace PulseRAM
                 cfg.ProtectedApps = new List<string> { "explorer.exe", "dwm.exe", "audiodg.exe" };
 
             cfg.EcoApps ??= new List<string>();
+            cfg.LeakIgnoredApps ??= new List<string>();
+            IsFirstRun = !cfg.WelcomeShown; // re-evaluated after migration below
             // JSON deserialisation creates a case-sensitive dictionary; process names are case-insensitive.
             cfg.AppMemoryCapsMb = new Dictionary<string, int>(cfg.AppMemoryCapsMb ?? new Dictionary<string, int>(), StringComparer.OrdinalIgnoreCase);
 
             bool needsSave = loaded == null || loadedFromSeed || cfg.ConfigVersion < EngineConfig.CurrentVersion;
-            MigrateConfig(cfg);
+            MigrateConfig(cfg, existingUserSettings: !freshDefaults && loaded != null);
             if (freshDefaults || loaded == null) ApplyDeviceTuning(cfg, Device);
+            IsFirstRun = !cfg.WelcomeShown;
             if (cfg.UiMode is not ("auto" or "lite" or "full")) cfg.UiMode = "auto";
             ClampConfig(cfg);
 
@@ -944,9 +999,18 @@ namespace PulseRAM
             }
         }
 
-        private static void MigrateConfig(EngineConfig cfg)
+        private static void MigrateConfig(EngineConfig cfg, bool existingUserSettings)
         {
             if (cfg.ConfigVersion >= EngineConfig.CurrentVersion) return;
+
+            // v3 (PulseRAM 1.4): the welcome card is for new installs only, not for people upgrading.
+            if (cfg.ConfigVersion < 3 && existingUserSettings) cfg.WelcomeShown = true;
+
+            if (cfg.ConfigVersion >= 2)
+            {
+                cfg.ConfigVersion = EngineConfig.CurrentVersion;
+                return;
+            }
 
             // v1 shipped aggressive defaults that trimmed every 30 s on low-RAM PCs.
             if (cfg.CooldownSeconds < 120) cfg.CooldownSeconds = 120;
@@ -1001,9 +1065,12 @@ namespace PulseRAM
             var ms = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
             double ramGb = GlobalMemoryStatusEx(ref ms) ? ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0) : 8.0;
             int cores = Math.Max(1, Environment.ProcessorCount);
-            DeviceTier tier = (ramGb < 7.0 || cores <= 2) ? DeviceTier.Low
-                : (ramGb < 15.0 || cores <= 4) ? DeviceTier.Mid
-                : DeviceTier.High;
+            DeviceTier tier = MemoryPolicy.ClassifyTier(ramGb, cores) switch
+            {
+                Tier.Low => DeviceTier.Low,
+                Tier.Mid => DeviceTier.Mid,
+                _ => DeviceTier.High
+            };
             return new DeviceInfo { RamGb = ramGb, LogicalCores = cores, Tier = tier };
         }
 
@@ -1015,33 +1082,14 @@ namespace PulseRAM
         /// </summary>
         public static void ApplyDeviceTuning(EngineConfig cfg, DeviceInfo device)
         {
-            int profileBump;
-            switch (device.Tier)
-            {
-                case DeviceTier.Low:
-                    cfg.RamThresholdPercent = 88;
-                    cfg.MinFreeRamGb = 0.5;
-                    cfg.CooldownSeconds = 300;
-                    cfg.MinProcessWorkingSetMb = 30.0;
-                    profileBump = 10;
-                    break;
-                case DeviceTier.Mid:
-                    cfg.RamThresholdPercent = 85;
-                    cfg.MinFreeRamGb = 0.75;
-                    cfg.CooldownSeconds = 180;
-                    cfg.MinProcessWorkingSetMb = 20.0;
-                    profileBump = 5;
-                    break;
-                default:
-                    cfg.RamThresholdPercent = 80;
-                    cfg.MinFreeRamGb = 1.5;
-                    cfg.CooldownSeconds = 120;
-                    cfg.MinProcessWorkingSetMb = 15.0;
-                    profileBump = 0;
-                    break;
-            }
+            var tier = device.Tier switch { DeviceTier.Low => Tier.Low, DeviceTier.Mid => Tier.Mid, _ => Tier.High };
+            var t = MemoryPolicy.TuningFor(tier);
+            cfg.RamThresholdPercent = t.TriggerPercent;
+            cfg.MinFreeRamGb = t.MinFreeGb;
+            cfg.CooldownSeconds = t.CooldownSeconds;
+            cfg.MinProcessWorkingSetMb = t.MinProcessWorkingSetMb;
             foreach (var p in cfg.Profiles)
-                p.RamThresholdPercent = Math.Clamp(p.RamThresholdPercent + profileBump, 50, 92);
+                p.RamThresholdPercent = MemoryPolicy.BumpProfileTrigger(p.RamThresholdPercent, tier);
             cfg.TunedForTier = device.TierName;
         }
 
@@ -1071,6 +1119,8 @@ namespace PulseRAM
         /// <summary>Process scans are the most expensive thing we do; halve their rate in lite mode.</summary>
         private int ScanIntervalMs => LiteMode ? 4400 : 2200;
 
+        private readonly object _saveLock = new object();
+
         public void SaveConfig()
         {
             try
@@ -1081,10 +1131,14 @@ namespace PulseRAM
                     Config.EcoApps = _ecoApps.ToList();
                     json = JsonSerializer.Serialize(Config, new JsonSerializerOptions { WriteIndented = true });
                 }
-                Directory.CreateDirectory(DataDirectory);
-                string tmp = _configPath + ".tmp";
-                File.WriteAllText(tmp, json);
-                File.Move(tmp, _configPath, overwrite: true);
+                // Saves come from the UI thread and engine threads; serialise the write + rename.
+                lock (_saveLock)
+                {
+                    Directory.CreateDirectory(DataDirectory);
+                    string tmp = _configPath + ".tmp";
+                    File.WriteAllText(tmp, json);
+                    File.Move(tmp, _configPath, overwrite: true);
+                }
             }
             catch (Exception ex)
             {
@@ -1205,7 +1259,7 @@ namespace PulseRAM
                             // A deliberate no-pressure skip is temporary: never back off for it, or a later real
                             // shortage could wait up to 30 minutes.
                             if (!ev.SkippedNoPressure && (stillPressured || ev.Skipped))
-                                _autoBackoffLevel = Math.Min(_autoBackoffLevel + 1, 6);
+                                _autoBackoffLevel = Math.Min(_autoBackoffLevel + 1, MemoryPolicy.MaxBackoffLevel);
                             return;
                         }
                     }
@@ -1227,8 +1281,7 @@ namespace PulseRAM
 
         private int EffectiveCooldownSeconds()
         {
-            double cd = Math.Max(30, Config.CooldownSeconds) * Math.Pow(2, _autoBackoffLevel);
-            return (int)Math.Min(cd, 1800);
+            return MemoryPolicy.BackoffCooldownSeconds(Config.CooldownSeconds, _autoBackoffLevel);
         }
 
         private void EnforceAppCapsAndLeakGuard(string foregroundApp)
@@ -1263,9 +1316,29 @@ namespace PulseRAM
 
             foreach (var item in grouped)
             {
-                if (string.Equals(item.Name, foregroundApp, StringComparison.OrdinalIgnoreCase))
-                    continue;
                 if (IsCritical(item.Name))
+                    continue;
+
+                // Leak history: remember every app that keeps growing, including the one in the foreground
+                // (the guard below never touches that one).
+                if (item.IsLeaking && item.PrivateMb >= 300)
+                {
+                    bool notify;
+                    LeakIncident? incident = null;
+                    lock (_stateLock)
+                    {
+                        notify = _leakHistory.Record(item.Name, item.LeakRateMbPerMin, item.PrivateMb, now,
+                            new HashSet<string>(Config.LeakIgnoredApps, StringComparer.OrdinalIgnoreCase));
+                        if (notify) incident = _leakHistory.Snapshot().FirstOrDefault(i => string.Equals(i.App, item.Name, StringComparison.OrdinalIgnoreCase));
+                    }
+                    if (notify && incident != null)
+                    {
+                        Log.Warn($"Possible leak: {item.Name} private memory +{item.LeakRateMbPerMin:F0} MB/min ({item.PrivateMb:F0} MB)");
+                        try { OnLeakDetected?.Invoke(incident); } catch (Exception ex) { Log.Error("Leak notification failed", ex); }
+                    }
+                }
+
+                if (string.Equals(item.Name, foregroundApp, StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 // Leak guard: sustained growth of PRIVATE memory. Trimming only relieves physical RAM;
@@ -1542,20 +1615,13 @@ namespace PulseRAM
 
             // Purging standby only helps when free memory is actually scarce: otherwise Windows hands out free
             // pages anyway and the purge just throws away useful cache. Repurposing confirms real pressure.
-            double lowFreeGb = Math.Max(0.5, totalGb * 0.04);
-            bool cacheIsLarge = standbyGb >= Math.Max(0.5, totalGb * 0.10);
-            bool purgeWorthwhile = cacheIsLarge && (freeGb < lowFreeGb || _repurposeMbPerMin >= 64.0);
+            bool purgeWorthwhile = MemoryPolicy.StandbyPurgeWorthwhile(totalGb, standbyGb, freeGb, _repurposeMbPerMin);
 
             double commitTotalGb = (perfInfo.CommitTotal.ToUInt64() * pageSize) / GB;
             double commitLimitGb = Math.Max(0.1, (perfInfo.CommitLimit.ToUInt64() * pageSize) / GB);
             double commitPct = (commitTotalGb / commitLimitGb) * 100.0;
             // Hysteresis so the warning doesn't flicker around a threshold.
-            string commitLevel = _commitLevel switch
-            {
-                "critical" => commitPct >= 93 ? "critical" : (commitPct >= 85 ? "high" : "ok"),
-                "high" => commitPct >= 96 ? "critical" : (commitPct >= 85 ? "high" : "ok"),
-                _ => commitPct >= 96 ? "critical" : (commitPct >= 90 ? "high" : "ok")
-            };
+            string commitLevel = MemoryPolicy.NextCommitLevel(_commitLevel, commitPct);
             _commitLevel = commitLevel;
 
             double pfTotalGb = Math.Max(0.0, (memStatus.ullTotalPageFile / GB) - totalGb);
@@ -2313,6 +2379,136 @@ namespace PulseRAM
         }
 
         /// <summary>Trims one application's processes (working-set trim only).</summary>
+        #region Leak history
+
+        public List<LeakIncident> GetLeakIncidents()
+        {
+            lock (_stateLock) return _leakHistory.Snapshot();
+        }
+
+        /// <summary>Removes an app from the list (it comes back if it starts leaking again).</summary>
+        public void DismissLeak(string app)
+        {
+            lock (_stateLock) _leakHistory.Dismiss(app, DateTime.Now);
+        }
+
+        /// <summary>Forgets an app entirely (e.g. after it was restarted: the new process starts with a clean slate).</summary>
+        public void ForgetLeak(string app)
+        {
+            lock (_stateLock) _leakHistory.Forget(app);
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetShellWindow();
+
+        /// <summary>Removes an app from the list and stops tracking it for good (undo by editing LeakIgnoredApps in the config).</summary>
+        public void IgnoreLeak(string app)
+        {
+            lock (_stateLock)
+            {
+                _leakHistory.Forget(app);
+                if (!Config.LeakIgnoredApps.Contains(app, StringComparer.OrdinalIgnoreCase))
+                    Config.LeakIgnoredApps.Add(BaseName(app));
+            }
+            SaveConfig();
+        }
+
+        /// <summary>
+        /// Restarts an app the way a user would: asks each of its windows to close (so it can save or prompt),
+        /// waits up to 15 s, then starts it again. Never force-kills, so no unsaved work is thrown away.
+        /// Blocking; call it off the UI thread.
+        /// </summary>
+        public (bool Ok, string Message) RestartApp(string app)
+        {
+            string name = BaseName(app);
+            if (IsUnfreezable(name) || string.Equals(name, "PulseRAM", StringComparison.OrdinalIgnoreCase))
+                return (false, $"{name} is part of Windows, so PulseRAM won't restart it. Signing out and back in (or restarting the PC) releases its memory.");
+
+            var procs = Process.GetProcessesByName(name);
+            try
+            {
+                if (procs.Length == 0)
+                {
+                    ForgetLeak(app);
+                    return (true, $"{name} is no longer running.");
+                }
+
+                string? path = null;
+                foreach (var p in procs)
+                {
+                    try { path ??= p.MainModule?.FileName; } catch { }
+                }
+
+                int asked = 0;
+                foreach (var p in procs)
+                {
+                    try { if (p.MainWindowHandle != IntPtr.Zero && p.CloseMainWindow()) asked++; } catch { }
+                }
+                if (asked == 0)
+                    return (false, $"{name} has no window PulseRAM can close. Close it yourself, then start it again.");
+
+                var deadline = DateTime.UtcNow.AddSeconds(15);
+                while (DateTime.UtcNow < deadline)
+                {
+                    if (procs.All(p => { try { return p.HasExited; } catch { return true; } })) break;
+                    Thread.Sleep(300);
+                }
+                bool allExited = procs.All(p => { try { return p.HasExited; } catch { return true; } });
+                if (!allExited)
+                    return (false, $"{name} is still open (it may be asking to save). Finish closing it, then start it again.");
+
+                ForgetLeak(app); // a fresh process: if it leaks again it should show up again
+                if (path == null)
+                    return (true, $"{name} closed. Start it again from the Start menu.");
+                try
+                {
+                    if (IsAdmin)
+                    {
+                        // Don't hand our administrator rights to the app: ask the running (non-elevated) Explorer
+                        // shell to start it, as if it was launched from the Start menu. Without a shell, a new
+                        // explorer.exe would inherit our elevation, so leave the relaunch to the user then.
+                        if (GetShellWindow() == IntPtr.Zero)
+                            return (true, $"{name} closed. Start it again from the Start menu.");
+                        Process.Start(new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"))
+                        {
+                            ArgumentList = { path },
+                            UseShellExecute = false
+                        });
+                    }
+                    else
+                    {
+                        Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+                    }
+
+                    // Explorer returns before the app starts, so confirm it actually came back.
+                    var until = DateTime.UtcNow.AddSeconds(8);
+                    bool back = false;
+                    while (!back && DateTime.UtcNow < until)
+                    {
+                        Thread.Sleep(400);
+                        var again = Process.GetProcessesByName(name);
+                        back = again.Length > 0;
+                        foreach (var p in again) p.Dispose();
+                    }
+                    Log.Info(back ? $"Restarted {name} to release leaked memory" : $"Closed {name}; it did not start again within 8 s");
+                    return back
+                        ? (true, $"{name} restarted.")
+                        : (true, $"{name} closed, but Windows didn't start it again. Start it from the Start menu.");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn($"Could not start {path} again", ex);
+                    return (true, $"{name} closed but couldn't be started again. Start it from the Start menu.");
+                }
+            }
+            finally
+            {
+                foreach (var p in procs) p.Dispose();
+            }
+        }
+
+        #endregion
+
         public OptimizationEvent OptimizeSingleApp(string appName, string reason = "Single App Trim")
         {
             lock (_optimizeLock)

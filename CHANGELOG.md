@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.4.0 — 2026-10-18
+
+### New
+- **Half the download size.** The installer is about 23 MB (22.5 MB for ARM64) instead of 45.6 MB, by leaving out the parts of .NET and the Windows SDK PulseRAM never uses.
+- **ARM64 build.** Native installer and portable zip for Windows on ARM (Snapdragon laptops, Surface Pro X …), tested on GitHub's ARM runners.
+- **Portable version.** Unzip and run; settings and logs stay in a `data` folder next to the EXE. It falls back to the normal location if that folder isn't writable.
+- **Update notice.** Once a day PulseRAM asks GitHub if there's a newer release and shows a banner with *Download* and *Skip this version*. It never downloads anything itself. You can turn it off (*Profiles → Device → Updates*) or *Check now*. This is PulseRAM's only network request.
+- **Welcome card** on a new install: the detected PC tier, what Auto-Pilot will do, and opt-ins for *Start with Windows* and update checks. People upgrading from 1.3 don't see it.
+- **Possible leaks list** (*Processes* tab). Apps caught growing are remembered with their peak rate, size and start time, and you get one notice per app (at most hourly).
+  - *Restart* closes the app normally, so it can save or ask you, then starts it again. It never force-closes, won't touch Windows components, and never hands PulseRAM's admin rights to the restarted app.
+  - *Dismiss* hides it until it leaks again later; *Ignore* hides it for good.
+- **Minimize to tray** (on by default). The minimize button hides PulseRAM to the system tray, where it keeps running; a one-time notice says where it went. Untick *Profiles → Device → Minimize to tray* for normal taskbar minimizing.
+- **Compact widget menu.** Right-click it for the clean mode, Focus Boost, Auto-Pilot, *See-through when idle* (fades to translucent while the mouse is elsewhere), full view and hide.
+- **Ready for code signing and winget.**
+  - Publishing a GitHub release now builds, tests and attaches every file automatically.
+  - Once SignPath Foundation approves the project, releases are also signed: [docs/SIGNING.md](docs/SIGNING.md).
+  - winget gets each new version as well: [winget/README.md](winget/README.md).
+
+### Improved
+- The installer no longer pre-ticks *Start with Windows* (it matters for silent installs, e.g. through winget).
+- Settings saves are serialised, so two quick changes can't lose one.
+- **Under the hood:**
+  - The 4,000-line window file is split into one file per area.
+  - The engine's decision logic (tiers, standby-purge policy, memory-limit warning, back-off, hotkeys, version compare, leak history) moved to `Core/` and is covered by 64 unit tests that run on every push.
+
 ## v1.3.1 — 2026-10-18
 
 ### Improved
