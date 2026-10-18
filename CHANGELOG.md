@@ -3,7 +3,7 @@
 ## v1.4.0 — 2026-10-18
 
 ### New
-- **Half the download size.** The installer is about @X64MB@ MB instead of 45.6 MB, by leaving out the parts of .NET and the Windows SDK PulseRAM never uses.
+- **Half the download size.** The installer is about 23 MB (22.5 MB for ARM64) instead of 45.6 MB, by leaving out the parts of .NET and the Windows SDK PulseRAM never uses.
 - **ARM64 build.** Native installer and portable zip for Windows on ARM (Snapdragon laptops, Surface Pro X …), tested on GitHub's ARM runners.
 - **Portable version.** Unzip and run; settings and logs stay in a `data` folder next to the EXE. It falls back to the normal location if that folder isn't writable.
 - **Update notice.** Once a day PulseRAM asks GitHub if there's a newer release and shows a banner with *Download* and *Skip this version*. It never downloads anything itself. You can turn it off (*Profiles → Device → Updates*) or *Check now*. This is PulseRAM's only network request.

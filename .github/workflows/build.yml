@@ -150,6 +150,8 @@ jobs:
           #    Windows to dark mode while running to exercise the live theme change.
           #    (The welcome card from run 1 was never answered, so mark it answered.)
           (Get-Content $cfg -Raw) -replace '"WelcomeShown":\s*false', '"WelcomeShown": true' | Set-Content $cfg -Encoding utf8
+          $logFile = Get-ChildItem (Join-Path $data "logs") -Filter "pulseram-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $run2From = (Get-Content $logFile.FullName).Count   # only look at what run 2 logs
           $p = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 15
           Assert-Running $p "second start"
@@ -177,9 +179,8 @@ jobs:
           # Minimize to tray: the minimize command should hide the window, not end the app.
           # (Needs the tray icon; on a runner sitting at the Windows setup screen it can't be added, and then
           # PulseRAM rightly minimizes normally.)
-          $logNow = Get-ChildItem (Join-Path $data "logs") -Filter "pulseram-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          $trayOk = (Get-Content $logNow.FullName | Select-String "Tray icon added" | Select-Object -Last 1) -ne $null -and
-                    -not (Get-Content $logNow.FullName -Tail 30 | Select-String "Tray icon could not be added")
+          $run2 = Get-Content $logFile.FullName | Select-Object -Skip $run2From
+          $trayOk = ($run2 | Select-String "Tray icon added") -ne $null
           if ($trayOk) {
             $p.Refresh(); $hwnd = $p.MainWindowHandle
             [Win32.Msg]::PostMessage($hwnd, 0x0112, [IntPtr]0xF020, [IntPtr]::Zero) | Out-Null

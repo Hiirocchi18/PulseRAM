@@ -23,8 +23,8 @@ From the [Releases page](https://github.com/Hiirocchi18/PulseRAM/releases/latest
 
 | Your PC | Installer | Or portable (no install) |
 |---|---|---|
-| Most PCs (Intel / AMD) | `PulseRAM-Setup-v1.4.0.exe` (~@X64MB@ MB) | `PulseRAM-Portable-v1.4.0-x64.zip` |
-| Windows on ARM (Snapdragon, Surface Pro X …) | `PulseRAM-Setup-v1.4.0-arm64.exe` (~@ARMMB@ MB) | `PulseRAM-Portable-v1.4.0-arm64.zip` |
+| Most PCs (Intel / AMD) | `PulseRAM-Setup-v1.4.0.exe` (~23 MB) | `PulseRAM-Portable-v1.4.0-x64.zip` |
+| Windows on ARM (Snapdragon, Surface Pro X …) | `PulseRAM-Setup-v1.4.0-arm64.exe` (~22.5 MB) | `PulseRAM-Portable-v1.4.0-arm64.zip` |
 
 Or with winget (once the listing is approved): `winget install PulseRAM`
 
@@ -41,7 +41,7 @@ Requirements: Windows 10 (1809 or newer) or Windows 11, 64-bit. Nothing else to 
 
 The download didn't arrive intact — the installer checks itself and refuses to run if even one byte is missing or changed. The file on GitHub is fine.
 
-* Check the size: right-click the file → **Properties**. `PulseRAM-Setup-v1.4.0.exe` is exactly **@X64BYTES@ bytes**; smaller means the download was cut off. Download it again from the Releases page and let it finish.
+* Check the size: right-click the file → **Properties**. It should match the size shown on the Releases page (about 23 MB for `PulseRAM-Setup-v1.4.0.exe`); smaller means the download was cut off. Download it again and let it finish.
 * Or check the SHA-256 in PowerShell: `Get-FileHash .\PulseRAM-Setup-v1.4.0.exe` must match the line in `SHA256SUMS.txt` on the release.
 * If the size is right but it still fails, antivirus has probably changed or locked the file. Restore it from quarantine / allow it, move it to a normal folder such as *Documents*, right-click → **Properties → Unblock**, and run it again.
 * Don't run it from inside a zip, a cloud-sync folder that is still syncing, or a messaging app's preview. The portable zip is a good fallback.

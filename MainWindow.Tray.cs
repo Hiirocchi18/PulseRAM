@@ -290,6 +290,9 @@ namespace PulseRAM
             RefreshAllUi(force: true);
         }
 
+        [DllImport("user32.dll")]
+        private static extern bool IsZoomed(IntPtr hWnd);
+
         private const uint WM_SYSCOMMAND = 0x0112;
         private const long SC_MINIMIZE = 0xF020;
 
@@ -298,6 +301,13 @@ namespace PulseRAM
         {
             try
             {
+                // Remember "maximized" now: the debounced placement save won't run once the window is hidden,
+                // and the tray click restores with SW_SHOWMAXIMIZED only if this is set.
+                if (!_isMiniHud && !IsIconic(_hwnd) && _engine.Config.WindowMaximized != IsZoomed(_hwnd))
+                {
+                    _engine.Config.WindowMaximized = IsZoomed(_hwnd);
+                    _engine.SaveConfig();
+                }
                 ShowWindow(_hwnd, 0 /* SW_HIDE */);
                 RefreshAllUi(); // pauses rendering and switches to Efficiency Mode while hidden
                 if (!_engine.Config.TrayHintShown)
