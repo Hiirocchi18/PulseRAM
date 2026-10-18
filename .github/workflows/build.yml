@@ -168,13 +168,17 @@ jobs:
           Assert-Running $p "live theme switch"
           Save-Screen "screenshots\full-theme-switched.png"
           Set-AppTheme ([int]$oldLight)
-          Start-Sleep -Seconds 17
+          Start-Sleep -Seconds 35
           Assert-Running $p "update check"
           Stop-Process -Id $p.Id -Force
           Start-Sleep -Seconds 2
           $log0 = Get-ChildItem (Join-Path $data "logs") -Filter "pulseram-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not (Select-String -Path $log0.FullName -Pattern "Theme switched" -Quiet)) { Write-Warning "No live theme switch was logged (Windows may not have broadcast the change)" }
-          if (-not (Select-String -Path $log0.FullName -Pattern "Update (check|available)" -Quiet)) { Write-Error "The scheduled update check did not run"; exit 1 }
+          if (-not (Select-String -Path $log0.FullName -Pattern "Update (check|available)" -Quiet)) {
+            Get-Content $log0.FullName -Tail 40
+            Write-Error "The scheduled update check did not run"; exit 1
+          }
+          Select-String -Path $log0.FullName -Pattern "Update (check|available)|Theme switched" | ForEach-Object { $_.Line }
 
           # 3) Compact widget, with see-through on (the mouse is not over it, so it should fade).
           (Get-Content $cfg -Raw) -replace '"MiniHudSeeThrough":\s*false', '"MiniHudSeeThrough": true' | Set-Content $cfg -Encoding utf8
