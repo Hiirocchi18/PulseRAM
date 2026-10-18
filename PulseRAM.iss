@@ -4,7 +4,19 @@
 ; -----------------------------------------------------------------------------
 
 #define MyAppName "PulseRAM"
-#define MyAppVersion "1.3.1"
+#define MyAppVersion "1.4.0"
+; Build for another CPU with:  ISCC /DMyArch=arm64 /DPublishDir=publish_arm64 PulseRAM.iss
+#ifndef MyArch
+  #define MyArch "x64"
+#endif
+#ifndef PublishDir
+  #define PublishDir "publish_selfcontained"
+#endif
+#if MyArch == "arm64"
+  #define ArchSuffix "-arm64"
+#else
+  #define ArchSuffix ""
+#endif
 #define MyAppPublisher "Hiirocchi18"
 #define MyAppURL "https://github.com/Hiirocchi18/PulseRAM"
 #define MyAppExeName "PulseRAM.exe"
@@ -22,14 +34,20 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 OutputDir=dist
-OutputBaseFilename=PulseRAM-Setup-v{#MyAppVersion}
+OutputBaseFilename=PulseRAM-Setup-v{#MyAppVersion}{#ArchSuffix}
 SetupIconFile=PulseRAM.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
 WizardSizePercent=105
+#if MyArch == "arm64"
+ArchitecturesInstallIn64BitMode=arm64
+ArchitecturesAllowed=arm64
+#else
+; x64compatible also allows Windows on ARM (runs under emulation); the -arm64 installer is native there.
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
+#endif
 PrivilegesRequiredOverridesAllowed=dialog commandline
 PrivilegesRequired=lowest
 CloseApplications=yes
@@ -46,7 +64,7 @@ Name: "runonstartup"; Description: "Launch PulseRAM minimized in System Tray whe
 
 [Files]
 ; User settings are stored in %LocalAppData%\PulseRAM, so never ship a pulseram_config.json from a dev run.
-Source: "publish_selfcontained\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pdb,startup.log,pulseram_config.json,pulseram_defaults.json"
+Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pdb,startup.log,pulseram_config.json,pulseram_defaults.json,portable.txt,data"
 ; Defaults are always refreshed on upgrade; a v1.0 pulseram_config.json already in {app} is imported once by the app.
 Source: "pulseram_defaults.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "PulseRAM.ico"; DestDir: "{app}"; Flags: ignoreversion

@@ -1,0 +1,72 @@
+name: Release
+
+# Runs when YOU publish a release on GitHub (Releases → Draft a new release → tag vX.Y.Z → Publish).
+# Builds and tests x64 + ARM64, signs them if SignPath is configured, attaches the installers, portable
+# zips and checksums to that release, then submits the new version to winget if WINGET_TOKEN is set.
+# You don't need to upload any files yourself.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      release_tag: ${{ github.event.release.tag_name }}
+    secrets: inherit
+
+  attach:
+    name: Attach files to the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: PulseRAM-v*
+          path: files
+          merge-multiple: true
+
+      - name: Check the version matches the tag
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          ls -la files
+          if ! ls files | grep -q "PulseRAM-Setup-v${tag#v}.exe"; then
+            echo "::error::The release tag ($tag) doesn't match the version in PulseRAM.csproj. Fix one of them and publish again."
+            exit 1
+          fi
+          cat files/SHA256SUMS-*.txt > files/SHA256SUMS.txt
+          rm files/SHA256SUMS-*.txt
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" files/* --clobber --repo "${{ github.repository }}"
+
+  winget:
+    name: Update winget
+    needs: attach
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: windows-latest
+    env:
+      HAS_TOKEN: ${{ secrets.WINGET_TOKEN != '' }}
+    steps:
+      - name: Skip (no WINGET_TOKEN secret)
+        if: env.HAS_TOKEN != 'true'
+        run: echo "WINGET_TOKEN is not set, so winget was not updated. See winget/README.md."
+
+      # Opens a pull request on microsoft/winget-pkgs from your fork. The first version must be submitted by hand
+      # (winget/Submit-Winget.ps1); after that, this keeps winget up to date with every release.
+      - uses: vedantmgoyal9/winget-releaser@main
+        if: env.HAS_TOKEN == 'true'
+        with:
+          identifier: Hiirocchi18.PulseRAM
+          installers-regex: 'PulseRAM-Setup-v[0-9.]+(-arm64)?\.exe$'
+          release-notes-url: https://github.com/Hiirocchi18/PulseRAM/releases/tag/${{ github.event.release.tag_name }}
+          token: ${{ secrets.WINGET_TOKEN }}

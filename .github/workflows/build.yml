@@ -2,17 +2,55 @@ name: Build installer
 
 on:
   push:
-    branches: [main, "fix/**"]
+    branches: [main, "fix/**", "feature/**"]
   pull_request:
   workflow_dispatch:
+  # Called by release.yml when a release is published (signs the files when SignPath is set up).
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
+  actions: read   # lets the SignPath action read this run's artifacts
 
 jobs:
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Run tests
+        run: dotnet test tests/PulseRAM.Tests/PulseRAM.Tests.csproj --logger "console;verbosity=normal"
+
   build:
-    runs-on: windows-latest
-    timeout-minutes: 30
+    name: Build ${{ matrix.arch }}
+    needs: tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            platform: x64
+            runner: windows-latest
+            suffix: ""
+          - arch: arm64
+            platform: ARM64
+            runner: windows-11-arm
+            suffix: "-arm64"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      PUBLISH: publish_${{ matrix.arch }}
+      # Code signing runs only for releases, and only once SignPath is configured (see docs/SIGNING.md).
+      SIGNING: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' && inputs.release_tag != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,114 +65,202 @@ jobs:
           [xml]$proj = Get-Content PulseRAM.csproj
           $v = ($proj.Project.PropertyGroup | Where-Object { $_.Version } | Select-Object -First 1).Version
           "version=$v" >> $env:GITHUB_OUTPUT
-          Write-Host "PulseRAM version $v"
+          Write-Host "PulseRAM version $v ($env:PROCESSOR_ARCHITECTURE runner)"
 
       - name: Publish self-contained (with WinUI resources)
         shell: pwsh
         run: |
-          # The csproj turns PRI generation off for quick local builds; the release build needs
-          # resources.pri and the Microsoft.UI.Xaml theme files, so turn it back on here. The PRI tasks ship
-          # with Visual Studio (not the dotnet CLI), so publish with Visual Studio's MSBuild.
+          # The PRI (WinUI resource) tasks ship with Visual Studio, not the dotnet CLI.
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -prerelease -products * -requires Microsoft.Component.MSBuild -property installationPath
           Write-Host "Visual Studio: $vs"
-          $msbuild = Join-Path $vs "MSBuild\Current\Bin\amd64\MSBuild.exe"
-          & $msbuild -version
-          Get-ChildItem (Join-Path $vs "MSBuild\Microsoft\VisualStudio") -Recurse -Filter Microsoft.Build.Packaging.Pri.Tasks.dll -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "PRI tasks: $($_.FullName)" }
-          $out = Join-Path $PWD "publish_selfcontained\"
-          & $msbuild PulseRAM.csproj -restore -t:Publish -v:normal -nologo "-flp:logfile=msbuild.log;verbosity=detailed" `
-            -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:SelfContained=true `
+          $msbuild = @("MSBuild\Current\Bin\arm64\MSBuild.exe", "MSBuild\Current\Bin\amd64\MSBuild.exe", "MSBuild\Current\Bin\MSBuild.exe") |
+            ForEach-Object { Join-Path $vs $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          Write-Host "MSBuild: $msbuild"
+          $out = Join-Path $PWD "$env:PUBLISH\"
+          & $msbuild PulseRAM.csproj -restore -t:Publish -v:minimal -nologo "-flp:logfile=msbuild.log;verbosity=normal" `
+            -p:Configuration=Release "-p:Platform=${{ matrix.platform }}" "-p:RuntimeIdentifier=win-${{ matrix.arch }}" -p:SelfContained=true `
             "-p:PublishDir=$out" `
             -p:EnableCoreMrtTooling=true -p:AppxGeneratePriEnabled=true -p:IncludeProjectPriFile=true
-          $code = $LASTEXITCODE
-          Write-Host "== PRI-related MSBuild targets =="
-          Select-String -Path msbuild.log -Pattern 'Target "(_GenerateProjectPri|_ExpandPri|_CreateProjectPriFileItem|_GenerateProjectPriFileCore|_ExpandProjectPriFile)[^"]*"|MakePri|Skipping target "_GenerateProjectPri' |
-            Select-Object -First 60 | ForEach-Object { Write-Host $_.Line.Trim() }
-          if ($code -ne 0) { exit $code }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item PulseRAM.ico $env:PUBLISH -Force
+          Get-ChildItem $env:PUBLISH -Filter *.pdb -Recurse | Remove-Item -Force
 
-      - name: Verify WinUI resources are present
+      - name: Verify files and report size
         shell: pwsh
         run: |
-          $dir = "publish_selfcontained"
-          Write-Host "== PRI / XBF anywhere in bin, obj, publish =="
-          Get-ChildItem bin, obj, $dir -Recurse -Include *.pri, *.xbf, priconfig.xml, *.resfiles -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host ("{0,10}  {1}" -f $_.Length, $_.FullName) }
-          Get-ChildItem $dir -Filter *.pri | Select-Object Name, Length | Format-Table -AutoSize
-          if (Test-Path "$dir\Microsoft.UI.Xaml") { Get-ChildItem "$dir\Microsoft.UI.Xaml" -Recurse | Select-Object FullName | Format-Table -AutoSize }
+          $dir = $env:PUBLISH
           $missing = @()
-          if (-not (Test-Path "$dir\Microsoft.UI.Xaml\Themes")) { Write-Host "Note: no loose Microsoft.UI.Xaml\Themes files (themes are read from the PRI files); the smoke test decides." }
           foreach ($f in @("PulseRAM.exe", "PulseRAM.dll", "resources.pri", "Microsoft.UI.Xaml.Controls.pri", "pulseram_defaults.json")) {
             if (-not (Test-Path (Join-Path $dir $f))) { $missing += $f }
           }
           if ($missing.Count -gt 0) { Write-Error "Missing from publish output: $($missing -join ', ')"; exit 1 }
+          $files = Get-ChildItem $dir -Recurse -File
+          "Publish output: {0} files, {1:N1} MB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB)
+          "== Largest files =="
+          $files | Sort-Object Length -Descending | Select-Object -First 15 | ForEach-Object { "{0,8:N2} MB  {1}" -f ($_.Length / 1MB), $_.FullName.Substring((Resolve-Path $dir).Path.Length + 1) }
+          "== Sub-folders =="
+          Get-ChildItem $dir -Directory | ForEach-Object {
+            $s = (Get-ChildItem $_.FullName -Recurse -File | Measure-Object Length -Sum).Sum
+            "{0,8:N2} MB  {1}\" -f ($s / 1MB), $_.Name
+          }
 
-      - name: Smoke test (launch, stay alive, write config)
+      - name: Smoke test (full view, compact view, screenshots)
         shell: pwsh
         run: |
-          $cfg = Join-Path $env:LOCALAPPDATA "PulseRAM\pulseram_config.json"
-          if (Test-Path $cfg) { Remove-Item $cfg -Force }
-          $p = Start-Process -FilePath "publish_selfcontained\PulseRAM.exe" -PassThru
-          Start-Sleep -Seconds 25
-          $p.Refresh()
-          if ($p.HasExited) {
-            Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-2) } -ErrorAction SilentlyContinue |
-              Where-Object { $_.ProviderName -in @('Application Error', '.NET Runtime', 'Windows Error Reporting') } |
-              Select-Object -First 5 | Format-List TimeCreated, ProviderName, Message
-            Write-Error "PulseRAM exited during startup (exit code $($p.ExitCode))."
-            exit 1
-          }
-          if (-not (Test-Path $cfg)) { Write-Error "PulseRAM did not write $cfg"; exit 1 }
-          $logDir = Join-Path $env:LOCALAPPDATA "PulseRAM\logs"
-          $log = Get-ChildItem $logDir -Filter "pulseram-*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $log) { Write-Error "PulseRAM did not write a log in $logDir"; exit 1 }
-          Write-Host "Log ($($log.Name)):"
-          Get-Content $log.FullName -TotalCount 20
-          if (Select-String -Path $log.FullName -Pattern " ERROR " -Quiet) { Write-Error "Errors were logged during startup"; exit 1 }
-          Write-Host "PulseRAM is running; config written:"
-          Get-Content $cfg -TotalCount 12
-          # Screenshots of the full view and the compact widget for review.
+          $exe = Join-Path $PWD "$env:PUBLISH\PulseRAM.exe"
+          $data = Join-Path $env:LOCALAPPDATA "PulseRAM"
+          if (Test-Path $data) { Remove-Item $data -Recurse -Force }
+          $cfg = Join-Path $data "pulseram_config.json"
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           function Save-Screen($path) {
-            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
-            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-            $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
-            $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
-            $g.Dispose(); $bmp.Dispose()
+            try {
+              $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+              $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+              $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+              $g.Dispose(); $bmp.Dispose()
+            } catch { Write-Host "Screenshot failed: $_" }
+          }
+          function Assert-Running($p, $what) {
+            $p.Refresh()
+            if ($p.HasExited) {
+              Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-3) } -ErrorAction SilentlyContinue |
+                Where-Object { $_.ProviderName -in @('Application Error', '.NET Runtime', 'Windows Error Reporting') } |
+                Select-Object -First 5 | Format-List TimeCreated, ProviderName, Message
+              Write-Error "PulseRAM exited during $what (exit code $($p.ExitCode))."
+              exit 1
+            }
           }
           New-Item -ItemType Directory -Force screenshots | Out-Null
-          try { Save-Screen "screenshots\full.png" } catch { Write-Host "Screenshot failed: $_" }
+
+          # 1) First run: full view with the welcome card.
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 25
+          Assert-Running $p "first start"
+          if (-not (Test-Path $cfg)) { Write-Error "PulseRAM did not write $cfg"; exit 1 }
+          Save-Screen "screenshots\welcome.png"
           Stop-Process -Id $p.Id -Force
           Start-Sleep -Seconds 2
-          $c = Start-Process -FilePath "publish_selfcontained\PulseRAM.exe" -ArgumentList "--compact" -PassThru
+
+          # 2) Second run: no welcome card.
+          $p = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 15
-          $c.Refresh()
-          if ($c.HasExited) { Write-Error "PulseRAM exited in compact view (exit code $($c.ExitCode))"; exit 1 }
-          try { Save-Screen "screenshots\compact.png" } catch { Write-Host "Screenshot failed: $_" }
+          Assert-Running $p "second start"
+          Save-Screen "screenshots\full.png"
+          Stop-Process -Id $p.Id -Force
+          Start-Sleep -Seconds 2
+
+          # 3) Compact widget, with see-through on (the mouse is not over it, so it should fade).
+          (Get-Content $cfg -Raw) -replace '"MiniHudSeeThrough":\s*false', '"MiniHudSeeThrough": true' | Set-Content $cfg -Encoding utf8
+          $c = Start-Process -FilePath $exe -ArgumentList "--compact" -PassThru
+          Start-Sleep -Seconds 15
+          Assert-Running $c "compact view"
+          Save-Screen "screenshots\compact.png"
           Stop-Process -Id $c.Id -Force
-          if (Select-String -Path $log.FullName -Pattern " ERROR " -Quiet) { Write-Error "Errors were logged in compact view"; exit 1 }
-          # Exercise the installer's thaw entry point too.
-          $t = Start-Process -FilePath "publish_selfcontained\PulseRAM.exe" -ArgumentList "--thaw-frozen" -PassThru -Wait
+
+          $log = Get-ChildItem (Join-Path $data "logs") -Filter "pulseram-*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $log) { Write-Error "PulseRAM did not write a log"; exit 1 }
+          Get-Content $log.FullName -TotalCount 40
+          if (Select-String -Path $log.FullName -Pattern " ERROR " -Quiet) { Write-Error "Errors were logged"; exit 1 }
+
+          $t = Start-Process -FilePath $exe -ArgumentList "--thaw-frozen" -PassThru -Wait
           Write-Host "--thaw-frozen exit code: $($t.ExitCode)"
 
-      - name: Build installer (Inno Setup)
+      - name: Upload app files for signing
+        id: unsigned-app
+        if: env.SIGNING == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-app-${{ matrix.arch }}
+          path: |
+            ${{ env.PUBLISH }}/PulseRAM.exe
+            ${{ env.PUBLISH }}/PulseRAM.dll
+
+      - name: Sign app files (SignPath)
+        if: env.SIGNING == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'PulseRAM' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: app
+          github-artifact-id: ${{ steps.unsigned-app.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed-app
+
+      - name: Use signed app files
+        if: env.SIGNING == 'true'
+        shell: pwsh
+        run: |
+          Copy-Item signed-app\* $env:PUBLISH -Force
+          Get-AuthenticodeSignature "$env:PUBLISH\PulseRAM.exe" | Format-List Status, SignerCertificate
+
+      - name: Build installer and portable zip
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
           $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) { Write-Error "ISCC.exe not found"; exit 1 }
-          & $iscc PulseRAM.iss
+          & $iscc "/DMyArch=${{ matrix.arch }}" "/DPublishDir=$env:PUBLISH" PulseRAM.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $exe = "dist\PulseRAM-Setup-v${{ steps.ver.outputs.version }}.exe"
+          $exe = "dist\PulseRAM-Setup-v${{ steps.ver.outputs.version }}${{ matrix.suffix }}.exe"
           if (-not (Test-Path $exe)) { Write-Error "Installer not produced"; exit 1 }
-          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
-          "$hash  PulseRAM-Setup-v${{ steps.ver.outputs.version }}.exe" | Out-File -Encoding ascii "dist\SHA256SUMS.txt"
-          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
+
+          $portable = "portable_${{ matrix.arch }}"
+          Copy-Item $env:PUBLISH $portable -Recurse
+          Copy-Item portable.txt $portable
+          Compress-Archive -Path "$portable\*" -DestinationPath "dist\PulseRAM-Portable-v${{ steps.ver.outputs.version }}-${{ matrix.arch }}.zip" -CompressionLevel Optimal
+          Get-ChildItem dist | ForEach-Object { "{0,8:N1} MB  {1}" -f ($_.Length / 1MB), $_.Name }
+
+      - name: Upload installer for signing
+        id: unsigned-installer
+        if: env.SIGNING == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installer-${{ matrix.arch }}
+          path: dist/PulseRAM-Setup-v${{ steps.ver.outputs.version }}${{ matrix.suffix }}.exe
+
+      - name: Sign installer (SignPath)
+        if: env.SIGNING == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'PulseRAM' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed-installer
+
+      - name: Use signed installer
+        if: env.SIGNING == 'true'
+        shell: pwsh
+        run: Copy-Item signed-installer\*.exe dist -Force
+
+      - name: Test portable version
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "pulseram-portable"
+          Expand-Archive "dist\PulseRAM-Portable-v${{ steps.ver.outputs.version }}-${{ matrix.arch }}.zip" -DestinationPath $dir -Force
+          $p = Start-Process -FilePath (Join-Path $dir "PulseRAM.exe") -PassThru
+          Start-Sleep -Seconds 20
+          $p.Refresh()
+          if ($p.HasExited) { Write-Error "Portable PulseRAM exited during startup (exit code $($p.ExitCode))"; exit 1 }
+          Stop-Process -Id $p.Id -Force
+          $cfg = Join-Path $dir "data\pulseram_config.json"
+          if (-not (Test-Path $cfg)) { Write-Error "Portable mode did not keep its settings next to the EXE ($cfg)"; exit 1 }
+          Write-Host "Portable settings: $cfg"
 
       - name: Test installer (silent install, launch, uninstall)
         shell: pwsh
         run: |
-          $exe = "dist\PulseRAM-Setup-v${{ steps.ver.outputs.version }}.exe"
+          $exe = "dist\PulseRAM-Setup-v${{ steps.ver.outputs.version }}${{ matrix.suffix }}.exe"
           $inst = Start-Process -FilePath $exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER" -PassThru -Wait
           if ($inst.ExitCode -ne 0) { Write-Error "Installer exit code $($inst.ExitCode)"; exit 1 }
           $app = Join-Path $env:LOCALAPPDATA "Programs\PulseRAM\PulseRAM.exe"
@@ -150,17 +276,26 @@ jobs:
           Start-Sleep -Seconds 3
           if (Get-Process -Name PulseRAM -ErrorAction SilentlyContinue) { Write-Error "PulseRAM still running after uninstall"; exit 1 }
 
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -File | Where-Object { $_.Extension -in '.exe', '.zip' } | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash)  $($_.Name)"
+          } | Out-File -Encoding ascii "dist\SHA256SUMS-${{ matrix.arch }}.txt"
+          Get-Content "dist\SHA256SUMS-${{ matrix.arch }}.txt"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: screenshots
+          name: screenshots-${{ matrix.arch }}
           path: screenshots/
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:
-          name: PulseRAM-Setup-v${{ steps.ver.outputs.version }}
+          name: PulseRAM-v${{ steps.ver.outputs.version }}-${{ matrix.arch }}
           path: |
-            dist/PulseRAM-Setup-v${{ steps.ver.outputs.version }}.exe
-            dist/SHA256SUMS.txt
+            dist/*.exe
+            dist/*.zip
+            dist/SHA256SUMS-*.txt
           if-no-files-found: error
