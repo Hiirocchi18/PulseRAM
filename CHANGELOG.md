@@ -16,7 +16,7 @@ Security release. Upgrading is recommended for everyone who used "Start with Win
   - Settings are saved atomically.
   - On Windows 11 22H2+, Windows' own *RedirectionGuard* is switched on as well.
   - If its safety record for frozen apps can't be saved, PulseRAM won't freeze anything.
-- When elevated, PulseRAM no longer searches `PATH` folders for DLLs. Some of those folders are user-writable.
+- When elevated, PulseRAM no longer loads DLLs from the current folder.
 - Elevated caps, freezing and Eco mode also skip elevated or SYSTEM processes running on your desktop.
 - When elevated, PulseRAM opens the release page and the log folder through Explorer, so they don't run as administrator.
 - Hardening:
