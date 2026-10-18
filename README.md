@@ -7,6 +7,35 @@
 ![Runtime](https://img.shields.io/badge/Runtime-.NET%2010%20(Self--Contained)-512BD4?logo=dotnet)
 ![Architecture](https://img.shields.io/badge/Architecture-x64-00599C)
 ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/Version-1.3.1-38BDF8)
+
+<p align="center">
+  <img src="docs/screenshot-full.png" alt="PulseRAM dashboard" width="760"><br>
+  <img src="docs/screenshot-compact.png" alt="PulseRAM compact widget" width="304"><br>
+  <sub>The dashboard and the compact widget (light theme; dark theme follows Windows).</sub>
+</p>
+
+---
+
+## Download & Install
+
+1. Download **`PulseRAM-Setup-v1.3.1.exe`** from the [Releases page](https://github.com/Hiirocchi18/PulseRAM/releases/latest).
+2. Run it. The installer is not code-signed yet, so Windows SmartScreen may say *"Windows protected your PC"* — click **More info → Run anyway**.
+3. Pick *Launch PulseRAM minimized in System Tray when Windows starts* if you want it running all the time.
+
+Requirements: Windows 10 (1809 or newer) or Windows 11, 64-bit. Nothing else to install — .NET and the Windows App SDK are bundled.
+For the Standby / Deep / Max purges, click **Admin** in the app (or run it as administrator).
+
+<details>
+<summary><b>"The setup files are corrupted. Please obtain a new copy of the program."</b></summary>
+
+The download didn't arrive intact — the installer checks itself and refuses to run if even one byte is missing or changed. The file on GitHub is fine.
+
+* Check the size: right-click the file → **Properties**. `PulseRAM-Setup-v1.3.1.exe` is exactly **45,540,687 bytes**; smaller means the download was cut off. Download it again from the Releases page and let it finish.
+* Or check the SHA-256 in PowerShell: `Get-FileHash .\PulseRAM-Setup-v1.3.1.exe` should print `30690BC87E8FC82F869B8DA844D933C55A02DDA07A7EB13FDD397586FDEB8563` (also in `SHA256SUMS.txt` on the release).
+* If the size is right but it still fails, antivirus has probably changed or locked the file. Restore it from quarantine / allow it, move it to a normal folder such as *Documents*, right-click → **Properties → Unblock**, and run it again.
+* Don't run it from inside a zip, a cloud-sync folder that is still syncing, or a messaging app's preview.
+</details>
 
 ---
 
@@ -95,15 +124,21 @@ Shielded apps, critical system processes and (by default) the foreground app are
 * **Live tray icon**: shows the current RAM % (green → amber → red with memory pressure), drawn crisply for any display scaling. Live tooltip and a quick-action menu; launching PulseRAM again brings the existing window forward.
 * **Light in the tray**: while hidden, PulseRAM stops drawing its UI and runs itself in Windows **Efficiency Mode** (EcoQoS, below-normal priority).
 
-### 6. Memory-limit warning
+### 6. Compact widget
+* The **compact** button (next to *Auto* in the top bar) turns PulseRAM into a small always-on-top widget, about 300 × 100: a RAM ring with the %, used / total, free memory and Auto-Pilot status, and one **Clean** button for the selected mode.
+* No title bar — drag it by its body, **double-click** it (or press ⤢) to return to the full view, or press — to hide it to the tray.
+* It remembers where you put it (top-right corner the first time), and only refreshes the numbers it shows, so it costs less CPU than the full window.
+* Start straight into it with `PulseRAM.exe --compact` (e.g. in a shortcut).
+
+### 7. Memory-limit warning
 * RAM % isn't what makes apps crash — the **commit limit** (RAM + page file) is. When committed memory passes 90% (critical at 96%), PulseRAM shows a banner (or a Windows notification while it's in the tray) with advice that fits your PC: no page file, a page file capped too low, or which app is using the most. One click opens the page-file settings. Trimming can't fix this, and PulseRAM says so. Toggle: *Profiles → Device → Memory warnings*.
 
-### 7. Feels native
+### 8. Feels native
 * **Light and dark theme** — follows Windows by default and switches live; or pick Dark/Light under *Profiles → Device*.
 * **Remembers its window** — size, position and maximized state are restored (safely re-centred if that monitor is gone), with a sensible minimum size.
 * **Crash log** — errors are written to `%LocalAppData%\PulseRAM\logs` (kept 7 days) instead of being silently ignored, and PulseRAM tells you if the last session ended unexpectedly. *Profiles → Device → Logs* opens the folder.
 
-### 8. Windows Startup
+### 9. Windows Startup
 * Toggle **Windows Startup** on the dashboard. When PulseRAM is running **as administrator**, startup is registered as an elevated Task Scheduler task (`PulseRAM Elevated Startup`) so Standby/Deep/Max kernel purges keep working after a reboot. Otherwise it uses the per-user `HKCU\...\Run` key and starts as a standard user.
 
 ---
@@ -112,12 +147,12 @@ Shielded apps, critical system processes and (by default) the foreground app are
 
 | File | Location | Purpose |
 |---|---|---|
-| `pulseram_config.json` | `%LocalAppData%\PulseRAM\` | Your settings (always writable, even for an all-users install). |
+| `pulseram_config.json` | `%LocalAppData%\PulseRAM\` | Your settings, plus window and compact-widget positions (always writable, even for an all-users install). |
 | `frozen_processes.json` | `%LocalAppData%\PulseRAM\` | Journal of PIDs PulseRAM has frozen; used to resume them after a crash. |
 | `logs\pulseram-*.log` | `%LocalAppData%\PulseRAM\` | Startup info, every sweep, warnings and errors (7 days, 2 MB per file). Attach these to bug reports. |
 | `pulseram_defaults.json` | Install folder | Defaults applied on first run. Settings saved by v1.0 next to the EXE are imported once. |
 
-Command-line switches: `--tray` (start hidden in the tray), `--thaw-frozen` (resume anything PulseRAM left suspended, then exit; used by the installer).
+Command-line switches: `--tray` (start hidden in the tray), `--compact` (open as the compact widget), `--thaw-frozen` (resume anything PulseRAM left suspended, then exit; used by the installer).
 
 ---
 
@@ -160,7 +195,9 @@ dotnet build -c Release -r win-x64
 
 The compiled single-file installer will be located in `dist\PulseRAM-Setup-v1.3.1.exe`.
 
-Every push is also built on GitHub Actions (`.github/workflows/build.yml`): publish, resource check, a launch smoke test, the Inno Setup installer, and a silent install → launch → uninstall test. The installer is attached to the run as an artifact.
+`Build-Installer.ps1` publishes with Visual Studio's MSBuild (the WinUI resource tools ship with Visual Studio 2022/2026, not the plain .NET SDK), so install Visual Studio with the *Windows application development* workload to build the installer locally.
+
+Every push is also built on GitHub Actions (`.github/workflows/build.yml`): publish, resource check, a launch smoke test in both the full and compact views (with screenshots), the Inno Setup installer, and a silent install → launch → uninstall test. The installer and screenshots are attached to the run as artifacts. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 > **Note:** the installer and binaries are not code-signed, so Windows SmartScreen shows a warning on first run. Signing with a code-signing certificate removes it.
 
