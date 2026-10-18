@@ -739,19 +739,15 @@ namespace PulseRAM
             }
         }
 
-        private static void WriteFrozenJournal(List<FrozenRecord> records)
+        private static bool WriteFrozenJournal(List<FrozenRecord> records)
         {
             try
             {
-                if (records.Count == 0)
-                {
-                    SafeFile.Delete(FrozenJournalPath);
-                    return;
-                }
+                if (records.Count == 0) return SafeFile.Delete(FrozenJournalPath);
                 Directory.CreateDirectory(DataDirectory);
-                SafeFile.WriteAllText(FrozenJournalPath, JsonSerializer.Serialize(records));
+                return SafeFile.WriteAllText(FrozenJournalPath, JsonSerializer.Serialize(records));
             }
-            catch { }
+            catch { return false; }
         }
 
         private static long TryGetStartTicks(Process proc)
@@ -2773,12 +2769,24 @@ namespace PulseRAM
                 if (affected == 0)
                     return (false, false, $"Could not suspend {appName} (not running or access denied).");
 
+                bool journaled;
                 lock (_stateLock)
                 {
                     _frozenApps.Add(appName);
                     _frozenRecords.AddRange(newRecords);
                     // Journal every frozen PID so a crash, kill or uninstall can never leave apps suspended.
-                    WriteFrozenJournal(_frozenRecords.ToList());
+                    journaled = WriteFrozenJournal(_frozenRecords.ToList());
+                    if (!journaled)
+                    {
+                        _frozenApps.Remove(appName);
+                        _frozenRecords.RemoveAll(r => newRecords.Contains(r));
+                    }
+                }
+                if (!journaled)
+                {
+                    // Never keep apps suspended without a record that lets a crashed PulseRAM resume them.
+                    foreach (var rec in newRecords) TryResumeRecord(rec);
+                    return (false, false, $"Couldn't freeze {appName}: PulseRAM can't save its safety record in {DataDirectory}.");
                 }
                 RequestRescan();
                 return (true, true, $"Froze {appName}: {affected} process(es) suspended, {trimmed} trimmed");

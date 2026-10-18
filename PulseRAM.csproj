@@ -91,7 +91,7 @@
   -->
   <Target Name="PulseRamDropUnusedRuntimeFiles" AfterTargets="Publish">
     <ItemGroup>
-      <PulseRamUnused Include="$(PublishDir)onnxruntime*.dll;$(PublishDir)DirectML*.dll;$(PublishDir)Microsoft.Windows.AI*.dll;$(PublishDir)Microsoft.Windows.Widgets*.dll;$(PublishDir)Microsoft.DiaSymReader.Native.*.dll" />
+      <PulseRamUnused Include="$(PublishDir)onnxruntime*.dll;$(PublishDir)Microsoft.ML.OnnxRuntime*.dll;$(PublishDir)DirectML*.dll;$(PublishDir)Microsoft.Windows.AI*.dll;$(PublishDir)Microsoft.Windows.Widgets*.dll;$(PublishDir)Microsoft.DiaSymReader.Native.*.dll" />
     </ItemGroup>
     <Delete Files="@(PulseRamUnused)" />
     <Message Importance="high" Text="PulseRAM: removed unused runtime files: @(PulseRamUnused->'%(Filename)%(Extension)', ', ')" />

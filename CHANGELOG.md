@@ -11,13 +11,19 @@ Security release. Upgrading is recommended for everyone who used "Start with Win
   - The uninstaller now removes the task too, asking for admin rights if needed.
 - The task definition can no longer be swapped while it is being registered. PulseRAM also checks afterwards that the task runs exactly its own EXE.
 - When elevated, memory caps, freezing and Eco mode only apply to apps in your own session, never to services or security software. Settings files are written by programs running as you, so they're not trusted to aim an elevated PulseRAM elsewhere.
-- When elevated, PulseRAM won't follow junctions or symlinks planted in its data or log folder.
+- When elevated, PulseRAM won't be redirected by junctions, symlinks or hard links planted in its data or log folder.
+  - Every write and delete is checked against the real file it opened.
+  - Settings are saved atomically.
+  - On Windows 11 22H2+, Windows' own *RedirectionGuard* is switched on as well.
+  - If its safety record for frozen apps can't be saved, PulseRAM won't freeze anything.
+- When elevated, PulseRAM no longer searches `PATH` folders for DLLs. Some of those folders are user-writable.
+- Elevated caps, freezing and Eco mode also skip elevated or SYSTEM processes running on your desktop.
 - When elevated, PulseRAM opens the release page and the log folder through Explorer, so they don't run as administrator.
 - Hardening:
   - The installer calls system tools by full path.
   - Build actions are pinned to exact commits, and the Inno Setup version is pinned.
   - The release tag is passed to scripts as data.
-- Updated the Windows App SDK from 1.6 to 1.8 (security and reliability fixes ship inside the app).
+- Updated the Windows App SDK from 1.6 to 1.8 (security and reliability fixes ship inside the app), leaving out its unused AI/ML and Widgets runtimes. The installer is now about 22 MB.
 
 ### Other
 - Removed the old manual release script, which contained a local folder path; publishing a release on GitHub now does everything.
