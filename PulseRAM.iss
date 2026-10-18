@@ -124,11 +124,7 @@ begin
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im PulseRAM.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-begin
-  ThawFrozenAppsAndStopPulseRAM();
-  Result := '';
-end;
+
 
 // The optional "start as administrator" logon task was created by an elevated PulseRAM, so removing it needs
 // admin rights. Leaving it behind would point an elevated task at a folder anyone could later fill, so if it
@@ -137,14 +133,27 @@ procedure RemoveElevatedStartupTask();
 var
   ResultCode: Integer;
   SchTasks: String;
+  Ok: Boolean;
 begin
   SchTasks := ExpandConstant('{sys}\schtasks.exe');
   if not Exec(SchTasks, '/Query /TN "PulseRAM Elevated Startup"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then exit;
   if ResultCode <> 0 then exit; // no task
   if IsAdmin then
-    Exec(SchTasks, '/Delete /TN "PulseRAM Elevated Startup" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
-  else if not ShellExec('runas', SchTasks, '/Delete /TN "PulseRAM Elevated Startup" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Ok := Exec(SchTasks, '/Delete /TN "PulseRAM Elevated Startup" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+  else
+    Ok := ShellExec('runas', SchTasks, '/Delete /TN "PulseRAM Elevated Startup" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if (not Ok) or (ResultCode <> 0) then
     SuppressibleMsgBox('PulseRAM''s "start as administrator" task could not be removed. Open Task Scheduler as administrator and delete "PulseRAM Elevated Startup".', mbInformation, MB_OK, IDOK);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  ThawFrozenAppsAndStopPulseRAM();
+  // A per-user install can never safely be started elevated: if an older version created that task,
+  // remove it now rather than waiting for the app to do it the next time it runs as administrator.
+  if not IsAdminInstallMode then
+    RemoveElevatedStartupTask();
+  Result := '';
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

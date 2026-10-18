@@ -630,8 +630,52 @@ namespace PulseRAM
         /// </summary>
         private static bool InUserSession(Process p)
         {
-            try { return p.SessionId == OwnSessionId && p.SessionId != 0; }
+            try
+            {
+                if (p.SessionId != OwnSessionId || p.SessionId == 0) return false;
+                // Elevated PulseRAM: also leave elevated / SYSTEM processes on the desktop alone (installers, admin
+                // tools, vendor agents). Only medium-or-lower integrity apps, i.e. ordinary user apps, qualify.
+                if (InstallSecurity.IsElevated) return IntegrityLevel(p.Id) is int il && il < 0x3000;
+                return true;
+            }
             catch { return false; }
+        }
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetTokenInformation(IntPtr token, int infoClass, IntPtr info, int length, out int returned);
+
+        [DllImport("advapi32.dll")]
+        private static extern IntPtr GetSidSubAuthority(IntPtr sid, uint index);
+
+        [DllImport("advapi32.dll")]
+        private static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+
+        /// <summary>Mandatory integrity level RID of a process (0x2000 medium, 0x3000 high, 0x4000 system), or null.</summary>
+        private static int? IntegrityLevel(int pid)
+        {
+            IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProc == IntPtr.Zero) return null;
+            try
+            {
+                if (!OpenProcessToken(hProc, TOKEN_QUERY, out IntPtr hTok)) return null;
+                try
+                {
+                    GetTokenInformation(hTok, 25 /* TokenIntegrityLevel */, IntPtr.Zero, 0, out int len);
+                    if (len <= 0) return null;
+                    IntPtr buf = Marshal.AllocHGlobal(len);
+                    try
+                    {
+                        if (!GetTokenInformation(hTok, 25, buf, len, out _)) return null;
+                        IntPtr sid = Marshal.ReadIntPtr(buf); // TOKEN_MANDATORY_LABEL.Label.Sid
+                        int count = Marshal.ReadByte(GetSidSubAuthorityCount(sid));
+                        if (count == 0) return null;
+                        return Marshal.ReadInt32(GetSidSubAuthority(sid, (uint)(count - 1)));
+                    }
+                    finally { Marshal.FreeHGlobal(buf); }
+                }
+                finally { CloseHandle(hTok); }
+            }
+            finally { CloseHandle(hProc); }
         }
 
         private static bool IsUnfreezable(string name) => IsCritical(name) || UnfreezableProcesses.Contains(BaseName(name));
@@ -661,9 +705,9 @@ namespace PulseRAM
                 // Only if the folder is writable (e.g. not unpacked into Program Files); otherwise use %LocalAppData%.
                 string dir = Path.Combine(AppContext.BaseDirectory, "data");
                 Directory.CreateDirectory(dir);
-                string probe = Path.Combine(dir, ".write-test");
-                File.WriteAllText(probe, "");
-                File.Delete(probe);
+                // CreateNew never follows an existing file or link; DeleteOnClose removes our own probe.
+                string probe = Path.Combine(dir, $".write-test-{Guid.NewGuid():N}");
+                using (new FileStream(probe, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1, FileOptions.DeleteOnClose)) { }
                 return true;
             }
             catch
@@ -699,14 +743,13 @@ namespace PulseRAM
         {
             try
             {
-                if (!InstallSecurity.IsSafeDataPath(FrozenJournalPath)) return;
                 if (records.Count == 0)
                 {
-                    if (File.Exists(FrozenJournalPath)) File.Delete(FrozenJournalPath);
+                    SafeFile.Delete(FrozenJournalPath);
                     return;
                 }
                 Directory.CreateDirectory(DataDirectory);
-                File.WriteAllText(FrozenJournalPath, JsonSerializer.Serialize(records));
+                SafeFile.WriteAllText(FrozenJournalPath, JsonSerializer.Serialize(records));
             }
             catch { }
         }
@@ -924,7 +967,7 @@ namespace PulseRAM
                     catch when (path == _configPath)
                     {
                         // Keep a copy of an unreadable user config before defaults overwrite it.
-                        try { if (InstallSecurity.IsSafeDataPath(_configPath)) File.Copy(_configPath, Path.Combine(DataDirectory, $"pulseram_config.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}.json"), true); } catch { }
+                        try { SafeFile.WriteAllText(Path.Combine(DataDirectory, $"pulseram_config.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}.json"), File.ReadAllText(_configPath)); } catch { }
                         loaded = null;
                     }
                 }
@@ -1150,9 +1193,12 @@ namespace PulseRAM
                 lock (_saveLock)
                 {
                     Directory.CreateDirectory(DataDirectory);
-                    if (!InstallSecurity.IsSafeDataPath(_configPath))
+                    if (InstallSecurity.IsElevated)
                     {
-                        Log.Warn($"Not saving settings: {DataDirectory} is redirected by a link");
+                        // Elevated: write in place through a verified handle (a temp file + rename could be
+                        // redirected by a link planted in the user-writable folder).
+                        if (!SafeFile.WriteAllText(_configPath, json))
+                            Log.Warn($"Not saving settings: {_configPath} is a link or redirected");
                         return;
                     }
                     string tmp = _configPath + ".tmp";

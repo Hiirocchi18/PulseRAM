@@ -64,6 +64,8 @@ namespace PulseRAM
         public static void Main(string[] args)
         {
             args ??= Array.Empty<string>();
+            // Elevated: ignore junctions planted by non-admin programs (Windows 11 22H2+).
+            SafeFile.EnableRedirectionGuard();
 
             // Used by the installer before upgrading/uninstalling: resume anything PulseRAM suspended.
             if (HasArg(args, "--thaw-frozen"))

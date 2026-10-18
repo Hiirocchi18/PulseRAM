@@ -39,7 +39,8 @@ namespace PulseRAM
         private const FileSystemRights WriteRights =
             FileSystemRights.WriteData | FileSystemRights.AppendData | FileSystemRights.WriteAttributes |
             FileSystemRights.WriteExtendedAttributes | FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles |
-            FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
+            FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership |
+            (FileSystemRights)0x10000000 /* GENERIC_ALL */ | (FileSystemRights)0x40000000 /* GENERIC_WRITE */;
 
         /// <summary>
         /// True only for an all-users install in Program Files whose folders and EXE/DLL can't be changed by
@@ -57,8 +58,7 @@ namespace PulseRAM
                 var roots = new[]
                 {
                     Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                    Environment.GetEnvironmentVariable("ProgramW6432") ?? ""
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86)
                 }.Where(r => r.Length > 3).Select(r => r.TrimEnd('\\')).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
                 string? root = roots.FirstOrDefault(r => dir.StartsWith(r + "\\", StringComparison.OrdinalIgnoreCase));
                 if (root == null) return false;
@@ -70,12 +70,14 @@ namespace PulseRAM
                     if (!di.Exists || (di.Attributes & FileAttributes.ReparsePoint) != 0) return false;
                     if (GrantsWriteToOthers(di.GetAccessControl())) return false;
                 }
-                foreach (var f in new[] { full, Path.Combine(dir, "PulseRAM.dll") })
+                // Every file and folder PulseRAM loads from: the EXE, its DLLs (.NET and Windows App SDK are
+                // bundled), resources and sub-folders. One writable DLL would be enough to take over an elevated start.
+                foreach (var entry in new DirectoryInfo(dir).EnumerateFileSystemInfos("*", new EnumerationOptions
+                         { RecurseSubdirectories = true, AttributesToSkip = 0, IgnoreInaccessible = false }))
                 {
-                    var fi = new FileInfo(f);
-                    if (!fi.Exists) continue;
-                    if ((fi.Attributes & FileAttributes.ReparsePoint) != 0) return false;
-                    if (GrantsWriteToOthers(fi.GetAccessControl())) return false;
+                    if ((entry.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+                    FileSystemSecurity sec = entry is DirectoryInfo d2 ? d2.GetAccessControl() : ((FileInfo)entry).GetAccessControl();
+                    if (GrantsWriteToOthers(sec)) return false;
                 }
                 return true;
             }
@@ -85,17 +87,22 @@ namespace PulseRAM
             }
         }
 
+        private static readonly string[] TrustedOwners = { "S-1-5-18", "S-1-5-32-544", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464" };
+
         private static bool GrantsWriteToOthers(FileSystemSecurity security)
         {
+            // The owner can always rewrite the permissions, so it must be SYSTEM, Administrators or TrustedInstaller.
+            string? owner = security.GetOwner(typeof(SecurityIdentifier))?.Value;
+            if (owner == null || !TrustedOwners.Contains(owner, StringComparer.OrdinalIgnoreCase)) return true;
+
             var rules = security.GetAccessRules(true, true, typeof(SecurityIdentifier));
             foreach (FileSystemAccessRule rule in rules)
             {
                 if (rule.AccessControlType != AccessControlType.Allow) continue;
-                if ((rule.PropagationFlags & PropagationFlags.InheritOnly) != 0) continue; // applies to children only
                 if ((rule.FileSystemRights & WriteRights) == 0) continue;
                 string sid = rule.IdentityReference.Value;
                 if (TrustedSids.Contains(sid, StringComparer.OrdinalIgnoreCase)) continue;
-                return true;
+                return true; // includes inherit-only grants: they'd apply to files added later
             }
             return false;
         }
@@ -144,9 +151,13 @@ namespace PulseRAM
                     return true;
                 }
                 if (GetShellWindow() == IntPtr.Zero) return false;
+                // Explorer splits its command line at commas, so pass folders as a file:// URI (commas escaped).
+                string arg = target.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+                    ? target
+                    : new Uri(Path.GetFullPath(target)).AbsoluteUri.Replace(",", "%2C");
                 Process.Start(new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"))
                 {
-                    ArgumentList = { target },
+                    ArgumentList = { arg },
                     UseShellExecute = false
                 });
                 return true;
