@@ -21,3 +21,8 @@ pulseram_history.json
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+publish_arm64/
+portable_x64/
+portable_arm64/
+tests/**/bin/
+tests/**/obj/

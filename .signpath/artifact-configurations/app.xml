@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration "app": signs PulseRAM.exe and PulseRAM.dll before they are packaged. -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="PulseRAM.exe">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="PulseRAM.dll">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>
