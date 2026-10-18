@@ -234,6 +234,12 @@ namespace PulseRAM
             _placementTimer.Tick += (s, e) => SaveWindowPlacement();
             _appWindow.Changed += (s, e) =>
             {
+                // Other ways of minimizing (Win+Down, Win+M, "Show desktop" doesn't count) end up here.
+                if (e.DidPresenterChange && _engine.Config.MinimizeToTray && _trayInitialized &&
+                    _appWindow.Presenter is OverlappedPresenter op && op.State == OverlappedPresenterState.Minimized)
+                {
+                    DispatcherQueue.TryEnqueue(HideToTray);
+                }
                 if (e.DidPositionChange || e.DidSizeChange || e.DidPresenterChange)
                 {
                     _placementTimer?.Stop();

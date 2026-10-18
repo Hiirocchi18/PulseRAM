@@ -288,8 +288,37 @@ namespace PulseRAM
             RefreshAllUi(force: true);
         }
 
+        private const uint WM_SYSCOMMAND = 0x0112;
+        private const long SC_MINIMIZE = 0xF020;
+
+        /// <summary>Hides the window to the tray (it keeps running; the tray icon or a second launch brings it back).</summary>
+        private void HideToTray()
+        {
+            try
+            {
+                ShowWindow(_hwnd, 0 /* SW_HIDE */);
+                RefreshAllUi(); // pauses rendering and switches to Efficiency Mode while hidden
+                if (!_engine.Config.TrayHintShown)
+                {
+                    _engine.Config.TrayHintShown = true;
+                    _engine.SaveConfig();
+                    ShowTrayBalloon("PulseRAM is still running", "It's in the system tray. Click the icon to open it. You can change this under Profiles → Device → Minimize to tray.", warning: false);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("Hide to tray failed", ex);
+            }
+        }
+
         private IntPtr CustomWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
         {
+            // Minimize button, taskbar click, Alt+Space → Minimize: hide to the tray instead (option).
+            if (msg == WM_SYSCOMMAND && (wParam.ToInt64() & 0xFFF0) == SC_MINIMIZE && _engine.Config.MinimizeToTray && _trayInitialized)
+            {
+                HideToTray();
+                return IntPtr.Zero;
+            }
             if (msg == WM_ENDSESSION && wParam != IntPtr.Zero)
             {
                 // Windows is restarting or signing out: the process is about to end without Window.Closed,

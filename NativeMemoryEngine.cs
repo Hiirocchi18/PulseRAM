@@ -216,6 +216,10 @@ namespace PulseRAM
         /// <summary>A version the user chose to skip ("1.4.1"); not offered again.</summary>
         public string SkippedUpdateVersion { get; set; } = "";
         public bool WelcomeShown { get; set; }
+        /// <summary>The window's minimize button hides PulseRAM to the tray instead of the taskbar.</summary>
+        public bool MinimizeToTray { get; set; } = true;
+        /// <summary>The one-time "still running in the tray" notice has been shown.</summary>
+        public bool TrayHintShown { get; set; }
         /// <summary>Compact widget becomes see-through while the mouse isn't over it.</summary>
         public bool MiniHudSeeThrough { get; set; }
         /// <summary>Last position of the compact widget (null = top-right corner).</summary>

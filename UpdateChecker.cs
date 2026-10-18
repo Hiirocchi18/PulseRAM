@@ -55,7 +55,6 @@ namespace PulseRAM
                 http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("PulseRAM", CurrentVersionText));
                 http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 
-                Log.Info("Update check: asking GitHub");
                 using var resp = await http.GetAsync(LatestApi, ct).ConfigureAwait(false);
                 if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
                 {
@@ -77,7 +76,11 @@ namespace PulseRAM
                 bool draft = root.TryGetProperty("draft", out var d) && d.ValueKind == JsonValueKind.True;
                 bool pre = root.TryGetProperty("prerelease", out var p) && p.ValueKind == JsonValueKind.True;
 
-                if (draft || pre || !VersionInfo.IsNewer(tag, CurrentVersion)) return (true, null);
+                if (draft || pre || !VersionInfo.IsNewer(tag, CurrentVersion))
+                {
+                    Log.Info($"Update check: up to date (latest release {tag})");
+                    return (true, null);
+                }
                 if (!VersionInfo.TryParseTag(tag, out var latest)) return (true, null);
                 string latestText = $"{latest.Major}.{latest.Minor}.{latest.Build}";
                 if (!ignoreSkipped && string.Equals(cfg.SkippedUpdateVersion, latestText, StringComparison.OrdinalIgnoreCase)) return (true, null);

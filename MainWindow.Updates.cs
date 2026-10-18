@@ -114,16 +114,22 @@ namespace PulseRAM
             _updateTimer.IsRepeating = true;
             _updateTimer.Tick += (s, e) =>
             {
-                bool due = UpdateChecker.IsDue(_engine.Config, DateTime.UtcNow);
-                Log.Info($"Update timer: due={due}, welcome open={_welcomeShowing}, enabled={_engine.Config.CheckForUpdates}");
                 // Wait for the user's answer on the welcome card (it has the opt-out).
                 if (_welcomeShowing) return;
                 // Every 4 h after a check; after a failed attempt (offline at logon, rate limit) retry in 30 min.
-                _updateTimer.Interval = TimeSpan.FromHours(4);
-                if (due) CheckForUpdates(manual: false);
+                SetUpdateTimerInterval(TimeSpan.FromHours(4));
+                if (UpdateChecker.IsDue(_engine.Config, DateTime.UtcNow)) CheckForUpdates(manual: false);
             };
             _updateTimer.Start();
-            Log.Info("Update checks scheduled");
+        }
+
+        /// <summary>A running DispatcherQueueTimer keeps its old interval until restarted.</summary>
+        private void SetUpdateTimerInterval(TimeSpan interval)
+        {
+            if (_updateTimer == null || _updateTimer.Interval == interval) return;
+            _updateTimer.Stop();
+            _updateTimer.Interval = interval;
+            _updateTimer.Start();
         }
 
         private async void CheckForUpdates(bool manual)
@@ -138,9 +144,9 @@ namespace PulseRAM
                     _engine.Config.LastUpdateCheckUtc = DateTime.UtcNow;
                     _engine.SaveConfig();
                 }
-                else if (!manual && _updateTimer != null)
+                else if (!manual)
                 {
-                    _updateTimer.Interval = TimeSpan.FromMinutes(30);
+                    SetUpdateTimerInterval(TimeSpan.FromMinutes(30));
                 }
                 if (info != null) ShowUpdateBanner(info, announce: true);
                 else if (manual) ShowToast(answered ? "You're up to date" : "Couldn't check for updates",

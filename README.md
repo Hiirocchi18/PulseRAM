@@ -133,6 +133,7 @@ Shielded apps, critical system processes and (by default) the foreground app are
   * `Ctrl + Alt + Shift + P`: Deep Sweep.
   * The defaults avoid `Ctrl+Shift+M` (Teams mute) and `Ctrl+Shift+P` (VS Code command palette). If a hotkey is already taken, PulseRAM tells you instead of failing silently.
 * **Live tray icon**: shows the current RAM % (green → amber → red with memory pressure), drawn crisply for any display scaling. Live tooltip and a quick-action menu; launching PulseRAM again brings the existing window forward.
+* **Minimize to tray** (on by default): the window's minimize button hides PulseRAM to the tray, where it keeps running; click the tray icon to bring it back. Untick *Profiles → Device → Minimize to tray* to minimize to the taskbar instead.
 * **Light in the tray**: while hidden, PulseRAM stops drawing its UI and runs itself in Windows **Efficiency Mode** (EcoQoS, below-normal priority).
 
 ### 6. Compact widget

@@ -157,7 +157,11 @@ jobs:
           $personalize = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
           $oldLight = (Get-ItemProperty $personalize -Name AppsUseLightTheme -ErrorAction SilentlyContinue).AppsUseLightTheme
           if ($null -eq $oldLight) { $oldLight = 1 }
-          Add-Type -Namespace Win32 -Name Msg -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam, uint flags, uint timeout, out IntPtr result);'
+          Add-Type -Namespace Win32 -Name Msg -MemberDefinition @'
+          [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam, uint flags, uint timeout, out IntPtr result);
+          [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+          [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+          '@
           function Set-AppTheme([int]$light) {
             New-ItemProperty $personalize -Name AppsUseLightTheme -Value $light -PropertyType DWord -Force | Out-Null
             $r = [IntPtr]::Zero
@@ -170,6 +174,13 @@ jobs:
           Set-AppTheme ([int]$oldLight)
           Start-Sleep -Seconds 35
           Assert-Running $p "update check"
+          # Minimize to tray: the minimize command should hide the window, not end the app.
+          $p.Refresh(); $hwnd = $p.MainWindowHandle
+          [Win32.Msg]::PostMessage($hwnd, 0x0112, [IntPtr]0xF020, [IntPtr]::Zero) | Out-Null
+          Start-Sleep -Seconds 3
+          Assert-Running $p "minimize to tray"
+          if ([Win32.Msg]::IsWindowVisible($hwnd)) { Write-Error "Minimize did not hide PulseRAM to the tray"; exit 1 }
+          Write-Host "Minimize to tray: window hidden, app still running"
           Stop-Process -Id $p.Id -Force
           Start-Sleep -Seconds 2
           $log0 = Get-ChildItem (Join-Path $data "logs") -Filter "pulseram-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1

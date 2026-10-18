@@ -1616,6 +1616,14 @@ namespace PulseRAM
                 _engine.Config.SmartStandbyPurge = chkSmartPurge.IsChecked == true;
                 _engine.SaveConfig();
             };
+            var chkMinTray = new CheckBox { Content = "Minimize to tray", FontSize = 12, MinWidth = 0, IsChecked = _engine.Config.MinimizeToTray };
+            ToolTipService.SetToolTip(chkMinTray, "The minimize button hides PulseRAM to the system tray (it keeps running). Untick to minimize to the taskbar instead.");
+            chkMinTray.Click += (s, e) =>
+            {
+                _engine.Config.MinimizeToTray = chkMinTray.IsChecked == true;
+                _engine.SaveConfig();
+            };
+            opts.Children.Add(chkMinTray);
             opts.Children.Add(chkTray);
             opts.Children.Add(chkEco);
             opts.Children.Add(chkSmartPurge);

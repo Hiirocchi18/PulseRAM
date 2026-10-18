@@ -11,6 +11,7 @@
 - **Possible leaks list** (*Processes* tab). Apps caught growing are remembered with their peak rate, size and start time, and you get one notice per app (at most hourly).
   - *Restart* closes the app normally, so it can save or ask you, then starts it again. It never force-closes, won't touch Windows components, and never hands PulseRAM's admin rights to the restarted app.
   - *Dismiss* hides it until it leaks again later; *Ignore* hides it for good.
+- **Minimize to tray** (on by default). The minimize button hides PulseRAM to the system tray, where it keeps running; a one-time notice says where it went. Untick *Profiles → Device → Minimize to tray* for normal taskbar minimizing.
 - **Compact widget menu.** Right-click it for the clean mode, Focus Boost, Auto-Pilot, *See-through when idle* (fades to translucent while the mouse is elsewhere), full view and hide.
 - **Ready for code signing and winget.**
   - Publishing a GitHub release now builds, tests and attaches every file automatically.
