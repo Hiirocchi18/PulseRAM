@@ -55,6 +55,7 @@ namespace PulseRAM
                 http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("PulseRAM", CurrentVersionText));
                 http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 
+                Log.Info("Update check: asking GitHub");
                 using var resp = await http.GetAsync(LatestApi, ct).ConfigureAwait(false);
                 if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
                 {
