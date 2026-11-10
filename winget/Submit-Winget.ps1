@@ -73,7 +73,7 @@ InstallerSwitches:
 UpgradeBehavior: install
 ProductCode: '$productCode'
 AppsAndFeaturesEntries:
-  - DisplayName: PulseRAM (WinUI 3 Memory Optimizer)
+  - DisplayName: PulseRAM
     Publisher: Hiirocchi18
     ProductCode: '$productCode'
 Installers:

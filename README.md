@@ -3,16 +3,16 @@
 > **Intelligent Memory Optimizer & Process Governor for Windows 10 & 11**
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6?logo=windows)
-![Framework](https://img.shields.io/badge/Framework-WinUI%203%20%7C%20WindowsAppSDK%201.6-4B0082?logo=dotnet)
-![Runtime](https://img.shields.io/badge/Runtime-.NET%2010%20(Self--Contained)-512BD4?logo=dotnet)
+![Language](https://img.shields.io/badge/Language-Rust-B7410E?logo=rust)
+![UI](https://img.shields.io/badge/UI-Slint%20(software%20renderer)-2379F4)
 ![Architecture](https://img.shields.io/badge/Architecture-x64%20%7C%20ARM64-00599C)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-1.4.1-38BDF8)
+![Version](https://img.shields.io/badge/Version-2.0.0-38BDF8)
 
 <p align="center">
   <img src="docs/screenshot-full.png" alt="PulseRAM dashboard" width="760"><br>
   <img src="docs/screenshot-compact.png" alt="PulseRAM compact widget" width="304"><br>
-  <sub>The dashboard and the compact widget (light theme; dark theme follows Windows).</sub>
+  <sub>The dashboard and the compact widget (screenshots from 1.4; 2.0 keeps the same layout).</sub>
 </p>
 
 ---
@@ -23,8 +23,8 @@ From the [Releases page](https://github.com/Hiirocchi18/PulseRAM/releases/latest
 
 | Your PC | Installer | Or portable (no install) |
 |---|---|---|
-| Most PCs (Intel / AMD) | `PulseRAM-Setup-v1.4.1.exe` (~22 MB) | `PulseRAM-Portable-v1.4.1-x64.zip` |
-| Windows on ARM (Snapdragon, Surface Pro X …) | `PulseRAM-Setup-v1.4.1-arm64.exe` (~21 MB) | `PulseRAM-Portable-v1.4.1-arm64.zip` |
+| Most PCs (Intel / AMD) | `PulseRAM-Setup-v2.0.0.exe` | `PulseRAM-Portable-v2.0.0-x64.zip` |
+| Windows on ARM (Snapdragon, Surface Pro X …) | `PulseRAM-Setup-v2.0.0-arm64.exe` | `PulseRAM-Portable-v2.0.0-arm64.zip` |
 
 Or with winget (once the listing is approved): `winget install PulseRAM`
 
@@ -34,15 +34,15 @@ Or with winget (once the listing is approved): `winget install PulseRAM`
 
 **Portable:** unzip anywhere you can write to (e.g. *Documents* or a USB stick) and run `PulseRAM.exe`. Settings and logs stay in a `data` folder next to it; nothing is installed. Delete the folder to remove it (turn off *Start with Windows* first if you enabled it).
 
-Requirements: Windows 10 (1809 or newer) or Windows 11, 64-bit. Nothing else to install — .NET and the Windows App SDK are bundled.
+Requirements: Windows 10 (1809 or newer) or Windows 11, 64-bit. Nothing else to install — PulseRAM is a single self-contained EXE.
 
 <details>
 <summary><b>"The setup files are corrupted. Please obtain a new copy of the program."</b></summary>
 
 The download didn't arrive intact — the installer checks itself and refuses to run if even one byte is missing or changed. The file on GitHub is fine.
 
-* Check the size: right-click the file → **Properties**. It should match the size shown on the Releases page (about 22 MB for `PulseRAM-Setup-v1.4.1.exe`); smaller means the download was cut off. Download it again and let it finish.
-* Or check the SHA-256 in PowerShell: `Get-FileHash .\PulseRAM-Setup-v1.4.1.exe` must match the line in `SHA256SUMS.txt` on the release.
+* Check the size: right-click the file → **Properties**. It should match the size shown on the Releases page (for `PulseRAM-Setup-v2.0.0.exe`); smaller means the download was cut off. Download it again and let it finish.
+* Or check the SHA-256 in PowerShell: `Get-FileHash .\PulseRAM-Setup-v2.0.0.exe` must match the line in `SHA256SUMS.txt` on the release.
 * If the size is right but it still fails, antivirus has probably changed or locked the file. Restore it from quarantine / allow it, move it to a normal folder such as *Documents*, right-click → **Properties → Unblock**, and run it again.
 * Don't run it from inside a zip, a cloud-sync folder that is still syncing, or a messaging app's preview. The portable zip is a good fallback.
 </details>
@@ -51,9 +51,11 @@ The download didn't arrive intact — the installer checks itself and refuses to
 
 ## Overview
 
-**PulseRAM** is a pure native Windows desktop application built with **C# (.NET 10)**, **WinUI 3 (`Microsoft.WindowsAppSDK 1.6`)**, and direct **Win32 / NT Kernel P/Invoke** (`ntdll.dll`, `psapi.dll`, `kernel32.dll`, `advapi32.dll`, `pdh.dll`).
+**PulseRAM** is a native Windows desktop application written in **Rust**. The engine talks directly to **Win32 / NT** (`ntdll.dll`, `psapi.dll`, `kernel32.dll`, `advapi32.dll`, `pdh.dll`); the interface is built with [Slint](https://slint.dev) and drawn by its software renderer.
 
-Unlike web-wrapper or legacy WinForms RAM cleaners, PulseRAM interacts directly with the Windows NT virtual memory manager without requiring third-party drivers or web runtimes. It collects no telemetry. Its only network request is an optional once-a-day check for a new version on GitHub (see *Privacy*).
+A tool that manages your RAM shouldn't need much of it. PulseRAM is one statically linked EXE — no .NET, no web runtime, no GPU surface, no drivers — and it releases its dashboard window completely while it sits in the tray. It collects no telemetry. Its only network request is an optional once-a-day check for a new version on GitHub (see *Privacy*).
+
+> **2.0 is a rewrite.** Versions up to 1.4.1 were C# / WinUI 3 and bundled .NET and the Windows App SDK. 2.0 keeps the same features, settings file and layout. See the [changelog](CHANGELOG.md).
 
 ---
 
@@ -69,7 +71,7 @@ PulseRAM detects your hardware on first run and tunes itself — no setup needed
 
 Low-RAM PCs normally run at a high memory load, so they get a higher trigger and a longer cooldown — otherwise Auto-Pilot would trim all the time and make the PC slower. Profile triggers are raised by the same margin.
 
-**Lite UI** (automatic on low-end PCs, or pick it under *Profiles → Device*) turns off ambient animations, refreshes every 3 s instead of 1.5 s, scans processes half as often, and shows fewer rows. Animations also switch off when Windows *Animation effects* is disabled. **Re-tune** on the same card restores the recommended values for your PC.
+**Lite UI** (automatic on low-end PCs, or pick it under *Profiles → Device*) refreshes every 3 s instead of 1.5 s, scans processes half as often, and shows fewer rows. **Re-tune** on the same card restores the recommended values for your PC.
 
 ---
 
@@ -87,11 +89,10 @@ Windows already manages memory well. Trimming a working set does **not** delete 
 
 The interface is deliberately minimal: short labels, with details in hover tooltips (mode cards, guard tiles, status chips, profiles).
 
-### 1. Memory Reactor Radial Gauge & 60 FPS Interpolation
-* **Dual Concentric Arcs**: In-use physical RAM alongside the real Windows **Standby list** size (read from the built-in `Memory` performance counters).
-* **Smooth Animation Loop**: 16ms (`DispatcherQueueTimer`) LERP interpolation for fluid transitions — paused automatically while PulseRAM is hidden in the tray.
-* **XAML Ambient Storyboards**: Breathing glow halo with dynamic pressure-color shifts (Optimal `#10B981`, Elevated `#F59E0B`, Critical `#F43F5E`) and continuous 360° dashed orbital ring rotation.
-* **Shockwave Burst**: Triggered on every memory optimization event with spring-ease animations.
+### 1. Memory gauge
+* **Two arcs**: in-use physical RAM alongside the real Windows **Standby list** size (read from the built-in `Memory` performance counters), plus a marker for the Auto-Pilot trigger.
+* **Pressure colours**: Optimal `#10B981`, Elevated `#F59E0B`, Critical `#F43F5E`.
+* The gauge eases between readings and is otherwise still: nothing repaints while the numbers aren't changing, and nothing is drawn at all while PulseRAM is hidden in the tray.
 
 ### 2. Intelligent Auto-Pilot & Active Guards
 * **Configurable Thresholds**: Sweeps when memory load reaches the set percentage or Available RAM falls below the floor (defaults depend on your PC — see *Built for any PC*).
@@ -134,11 +135,11 @@ Shielded apps, critical system processes and (by default) the foreground app are
   * The defaults avoid `Ctrl+Shift+M` (Teams mute) and `Ctrl+Shift+P` (VS Code command palette). If a hotkey is already taken, PulseRAM tells you instead of failing silently.
 * **Live tray icon**: shows the current RAM % (green → amber → red with memory pressure), drawn crisply for any display scaling. Live tooltip and a quick-action menu; launching PulseRAM again brings the existing window forward.
 * **Minimize to tray** (on by default): the window's minimize button hides PulseRAM to the tray, where it keeps running; click the tray icon to bring it back. Untick *Profiles → Device → Minimize to tray* to minimize to the taskbar instead.
-* **Light in the tray**: while hidden, PulseRAM stops drawing its UI and runs itself in Windows **Efficiency Mode** (EcoQoS, below-normal priority).
+* **Light in the tray**: while hidden, PulseRAM releases its window, stops preparing anything for display and runs itself in Windows **Efficiency Mode** (EcoQoS, below-normal priority).
 
 ### 6. Compact widget
 * The **compact** button (next to *Auto* in the top bar) turns PulseRAM into a small always-on-top widget, about 300 × 100: a RAM ring with the %, used / total, free memory and Auto-Pilot status, and one **Clean** button for the selected mode.
-* No title bar — drag it by its body, **double-click** it (or press ⤢) to return to the full view, or press — to hide it to the tray.
+* No title bar — drag it by its body, **double-click** it (or press the window button) to return to the full view, or press — to hide it to the tray.
 * It remembers where you put it (top-right corner the first time), and only refreshes the numbers it shows, so it costs less CPU than the full window.
 * **Right-click** it for the clean mode, Focus Boost, Auto-Pilot, *See-through when idle* (it fades to translucent while the mouse is elsewhere), full view and hide.
 * Start straight into it with `PulseRAM.exe --compact` (e.g. in a shortcut).
@@ -155,7 +156,7 @@ Shielded apps, critical system processes and (by default) the foreground app are
 ### 9. Windows Startup
 * Toggle **Windows Startup** on the dashboard. It normally uses the per-user `HKCU\...\Run` key and starts as a standard user.
 * **Starting as administrator at logon** (so Standby/Deep/Max purges work after a reboot) needs an **all-users install** — choose *Install for all users* in the installer, which puts PulseRAM in *Program Files*. Then, with PulseRAM running as administrator, turn on Windows Startup and it registers an elevated Task Scheduler task (`PulseRAM Elevated Startup`).
-  * PulseRAM refuses to do this for per-user or portable copies: their files can be changed by any program you run, so an automatic admin start would let such a program gain administrator rights. Older versions allowed it; PulseRAM 1.4.1 removes such a task the next time it runs as administrator, and the uninstaller removes it too.
+  * PulseRAM refuses to do this for per-user or portable copies: their files can be changed by any program you run, so an automatic admin start would let such a program gain administrator rights. Older versions allowed it; PulseRAM 1.4.1 and later remove such a task the next time it runs as administrator, and the uninstaller removes it too.
 
 ---
 
@@ -194,10 +195,9 @@ PulseRAM operates directly against official Windows NT subsystem and Win32 APIs:
 ## Building from Source
 
 ### Prerequisites
-* Windows 10 (Build 19041+) or Windows 11
-* [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
-* Visual Studio 2022/2026 with the *Windows application development* workload (the WinUI resource tools ship with it)
-* [Inno Setup 6](https://jrsoftware.org/isinfo.php) (for building the installer)
+* Windows 10 or 11
+* [Rust](https://rustup.rs) (stable) with the Visual Studio C++ build tools (rustup offers to install them)
+* [Inno Setup 6](https://jrsoftware.org/isinfo.php) (only for building the installer)
 
 ### Build Commands
 ```powershell
@@ -205,19 +205,30 @@ PulseRAM operates directly against official Windows NT subsystem and Win32 APIs:
 git clone https://github.com/Hiirocchi18/PulseRAM.git
 cd PulseRAM
 
-# Build Release binaries
-dotnet build -c Release -r win-x64
+# Release EXE: target\release\PulseRAM.exe (copy pulseram_defaults.json next to it)
+cargo build --release
 
 # Installer + portable zip (x64, or -Arch arm64)
 .\Build-Installer.ps1
 
 # Unit tests (any OS)
-dotnet test tests/PulseRAM.Tests/PulseRAM.Tests.csproj
+cargo test
 ```
 
-Output: `dist\PulseRAM-Setup-v1.4.1.exe` and `dist\PulseRAM-Portable-v1.4.1-x64.zip` (`-arm64` for ARM).
+Output: `dist\PulseRAM-Setup-v2.0.0.exe` and `dist\PulseRAM-Portable-v2.0.0-x64.zip` (`-arm64` for ARM).
 
-**Code layout:** `NativeMemoryEngine.cs` (memory engine), `Core/` (pure decision logic — tiers, purge policy, commit warning, back-off, hotkeys, versions, leak history — covered by `tests/`), `MainWindow.*.cs` (UI, one file per area), `UpdateChecker.cs`, `Log.cs`.
+**Code layout:**
+
+| Path | What it holds |
+|---|---|
+| `src/engine.rs` | The memory engine: sampling, Auto-Pilot loop, sweeps, freeze / Eco / cap governors. |
+| `src/sys/windows/` | Every Win32 / NT call (memory, processes, security checks, link-safe file writes, registry, HTTPS). |
+| `src/policy.rs`, `src/leaks.rs`, `src/config.rs` | Pure decision logic — tiers, purge policy, commit warning, back-off, hotkeys, versions, leak history, settings migration — with unit tests. |
+| `src/app.rs`, `ui/*.slint` | The interface and its glue. |
+| `src/shell.rs` | Tray icon, global hotkeys, native menus, single instance. |
+| `src/startup.rs`, `src/update.rs`, `src/log.rs` | Start with Windows, update check, log files. |
+
+On Linux or macOS, `cargo run` starts the interface against a small fake PC (`src/sys/stub.rs`), which is handy for working on the UI; PulseRAM itself only ships for Windows.
 
 **CI** (`.github/workflows/build.yml`): unit tests, then x64 (on `windows-latest`) and ARM64 (on GitHub's ARM runner) builds, each with launch tests (first run, live theme switch, update check, compact widget, screenshots), the portable zip test and a silent install → launch → uninstall test.
 
@@ -250,3 +261,5 @@ Every signed release is built by GitHub Actions from this repository's source ([
 ## License
 
 Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
+
+The interface is made with Slint, used under the [Slint Royalty-free License](https://slint.dev/terms-and-conditions#royalty-free).

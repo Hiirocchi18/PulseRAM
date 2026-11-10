@@ -1,28 +1,20 @@
-# Build and output directories
-bin/
-obj/
-bin_winui3/
-publish_selfcontained/
+# Build output
+target/
 dist/
+publish_*/
+portable_*/
 
-# Visual Studio & IDE files
+# IDE files
 .vs/
+.vscode/
+.idea/
 *.user
-*.userosscache
-*.sln.docstates
-*.suo
 
-# Runtime logs and machine-specific cache
+# Runtime logs and machine-specific files
 *.log
-startup.log
-pulseram_history.json
+pulseram_config.json
 
-# Windows thumbnails and OS files
+# OS files
 Thumbs.db
-ehthumbs.db
 Desktop.ini
-publish_arm64/
-portable_x64/
-portable_arm64/
-tests/**/bin/
-tests/**/obj/
+.DS_Store
