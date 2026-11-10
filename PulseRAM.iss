@@ -1,16 +1,19 @@
 ; -----------------------------------------------------------------------------
 ; PulseRAM — Inno Setup Script
-; Intelligent Kernel Memory Optimizer (WinUI 3 + NT Kernel Native)
+; Intelligent Memory Optimizer (Rust, native Win32 / NT)
 ; -----------------------------------------------------------------------------
 
 #define MyAppName "PulseRAM"
-#define MyAppVersion "1.4.1"
+; Normally passed by the build:  ISCC /DMyAppVersion=2.0.0 …
+#ifndef MyAppVersion
+  #define MyAppVersion "2.0.0"
+#endif
 ; Build for another CPU with:  ISCC /DMyArch=arm64 /DPublishDir=publish_arm64 PulseRAM.iss
 #ifndef MyArch
   #define MyArch "x64"
 #endif
 #ifndef PublishDir
-  #define PublishDir "publish_selfcontained"
+  #define PublishDir "publish_x64"
 #endif
 #if MyArch == "arm64"
   #define ArchSuffix "-arm64"
@@ -53,7 +56,7 @@ PrivilegesRequired=lowest
 CloseApplications=yes
 CloseApplicationsFilter=PulseRAM.exe
 UninstallDisplayIcon={app}\{#MyAppExeName}
-UninstallDisplayName={#MyAppName} (WinUI 3 Memory Optimizer)
+UninstallDisplayName={#MyAppName}
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -63,11 +66,25 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "runonstartup"; Description: "Launch PulseRAM minimized in System Tray when Windows starts"; GroupDescription: "Windows Integration:"; Flags: unchecked
 
 [Files]
-; User settings are stored in %LocalAppData%\PulseRAM, so never ship a pulseram_config.json from a dev run.
-Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pdb,startup.log,pulseram_config.json,pulseram_defaults.json,portable.txt,data"
+; User settings are stored in %LocalAppData%\PulseRAM, so nothing user-specific is ever shipped.
+Source: "{#PublishDir}\PulseRAM.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Defaults are always refreshed on upgrade; a v1.0 pulseram_config.json already in {app} is imported once by the app.
 Source: "pulseram_defaults.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "PulseRAM.ico"; DestDir: "{app}"; Flags: ignoreversion
+
+[InstallDelete]
+; PulseRAM 1.x was a .NET / WinUI 3 app with a few hundred runtime files. 2.0 is a single EXE: clear the old
+; runtime out of the install folder when upgrading (settings live elsewhere and are kept).
+Type: files; Name: "{app}\*.dll"
+Type: files; Name: "{app}\*.pri"
+Type: files; Name: "{app}\*.winmd"
+Type: files; Name: "{app}\*.deps.json"
+Type: files; Name: "{app}\*.runtimeconfig.json"
+Type: files; Name: "{app}\createdump.exe"
+Type: files; Name: "{app}\RestartAgent.exe"
+Type: filesandordirs; Name: "{app}\Microsoft.UI.Xaml"
+Type: filesandordirs; Name: "{app}\en-us"
+Type: filesandordirs; Name: "{app}\en"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\PulseRAM.ico"; Comment: "Intelligent Kernel Memory Optimizer"

@@ -40,7 +40,7 @@ jobs:
           tag="$TAG"
           ls -la files
           if ! ls files | grep -q "PulseRAM-Setup-v${tag#v}.exe"; then
-            echo "::error::The release tag ($tag) doesn't match the version in PulseRAM.csproj. Fix one of them and publish again."
+            echo "::error::The release tag ($tag) doesn't match the version in Cargo.toml. Fix one of them and publish again."
             exit 1
           fi
           cat files/SHA256SUMS-*.txt > files/SHA256SUMS.txt
