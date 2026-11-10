@@ -136,11 +136,11 @@ mod imp {
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WAIT_ABANDONED, WPARAM};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_ABANDONED, WPARAM};
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
     use windows_sys::Win32::Graphics::Gdi::{
-        CreateBitmap, CreateDIBSection, DeleteObject, GetMonitorInfoW, MonitorFromPoint, BITMAPINFO, BITMAPINFOHEADER, MONITORINFO, MONITOR_DEFAULTTONULL,
-        MONITOR_DEFAULTTOPRIMARY,
+        CreateBitmap, CreateDIBSection, DeleteObject, EnumDisplayMonitors, EnumDisplaySettingsExW, GetMonitorInfoW, MonitorFromPoint, BITMAPINFO,
+        BITMAPINFOHEADER, DEVMODEW, ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY,
     };
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, SetDllDirectoryW};
     use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
@@ -616,6 +616,29 @@ mod imp {
         work_area(MONITOR_DEFAULTTOPRIMARY, 0, 0).unwrap_or(Area { x: 0, y: 0, width: 1280, height: 720 })
     }
 
+    unsafe extern "system" fn refresh_rate_probe(monitor: HMONITOR, _dc: HDC, _area: *mut RECT, data: LPARAM) -> i32 {
+        let all_reported = &mut *(data as *mut bool);
+        let mut info: MONITORINFOEXW = zeroed();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO) != 0 {
+            let mut mode: DEVMODEW = zeroed();
+            mode.dmSize = size_of::<DEVMODEW>() as u16;
+            if EnumDisplaySettingsExW(info.szDevice.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode, 0) != 0 && mode.dmDisplayFrequency == 0 {
+                *all_reported = false;
+            }
+        }
+        1
+    }
+
+    /// False if a connected display reports a refresh rate of 0 Hz (some virtual and remote displays do). The
+    /// UI toolkit paces its drawing by that number and cannot open a window on such a display, so PulseRAM
+    /// stays in the tray there instead.
+    pub fn displays_report_refresh_rate() -> bool {
+        let mut all_reported = true;
+        unsafe { EnumDisplayMonitors(null_mut(), null(), Some(refresh_rate_probe), &mut all_reported as *mut bool as LPARAM) };
+        all_reported
+    }
+
     // ---- Process-wide ----
 
     /// Elevated: take the current directory out of the DLL search order.
@@ -711,6 +734,9 @@ mod imp {
     }
     pub fn primary_work_area() -> Area {
         Area { x: 0, y: 0, width: 1920, height: 1080 }
+    }
+    pub fn displays_report_refresh_rate() -> bool {
+        true
     }
     pub fn harden_dll_search() {}
     pub fn acquire_single_instance(_wait_for_previous: bool, _quiet: bool) -> Instance {

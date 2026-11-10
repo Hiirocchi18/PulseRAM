@@ -148,6 +148,11 @@ jobs:
           Assert-Running $p "second start"
           Save-Screen "screenshots\full.png"
           $p.Refresh()
+          if ($p.MainWindowHandle -eq [IntPtr]::Zero) {
+            Get-Content $logFile.FullName -Tail 20
+            Write-Error "PulseRAM is running but its dashboard window did not open"; exit 1
+          }
+          $p.Refresh()
           "PulseRAM memory with the dashboard open: {0:N1} MB working set, {1:N1} MB private" -f ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB)
           $personalize = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
           $oldLight = (Get-ItemProperty $personalize -Name AppsUseLightTheme -ErrorAction SilentlyContinue).AppsUseLightTheme
@@ -184,6 +189,15 @@ jobs:
             Start-Sleep -Seconds 4
             $p.Refresh()
             "PulseRAM memory hidden in the tray: {0:N1} MB working set, {1:N1} MB private" -f ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB)
+            # Launching PulseRAM again must bring the hidden window back instead of starting a second copy.
+            $again = Start-Process -FilePath $exe -PassThru
+            $again.WaitForExit(15000) | Out-Null
+            if (-not $again.HasExited) { Stop-Process -Id $again.Id -Force; Write-Error "A second PulseRAM kept running instead of handing over to the first"; exit 1 }
+            Start-Sleep -Seconds 4
+            Assert-Running $p "second launch"
+            $p.Refresh()
+            if ($p.MainWindowHandle -eq [IntPtr]::Zero -or -not [Win32.Msg]::IsWindowVisible($p.MainWindowHandle)) { Write-Error "A second launch did not bring PulseRAM back from the tray"; exit 1 }
+            Write-Host "Second launch: window restored from the tray"
           } else {
             Write-Host "The tray icon couldn't be added on this runner (no ready taskbar); minimize-to-tray test skipped"
           }

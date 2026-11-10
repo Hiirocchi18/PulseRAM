@@ -1193,6 +1193,9 @@ impl Ctx {
             let st = self.st.borrow();
             (st.mini_mode, st.visible)
         };
+        if !was_visible && !self.display_usable() {
+            return;
+        }
         if mini_mode {
             if !was_visible {
                 self.place_mini();
@@ -1224,6 +1227,21 @@ impl Ctx {
         self.update_minimize_hook();
         self.schedule_attach();
         self.refresh(true);
+    }
+
+    /// The interface can't be drawn on a display that reports a 0 Hz refresh rate (some virtual and remote
+    /// displays). PulseRAM keeps working from the tray there and says why the window stays closed.
+    fn display_usable(&self) -> bool {
+        if shell::displays_report_refresh_rate() {
+            return true;
+        }
+        log::warn("A display reports a 0 Hz refresh rate; the window stays closed and PulseRAM keeps running in the tray");
+        shell::tray_balloon(
+            "PulseRAM can't open its window on this display",
+            "This display doesn't report a refresh rate. PulseRAM keeps working from the tray; right-click its icon to clean memory.",
+            true,
+        );
+        false
     }
 
     /// A window's native handle only exists once the event loop has created it, so finish setting it up
@@ -1483,6 +1501,12 @@ impl Ctx {
             let st = self.st.borrow();
             (st.mini_mode, st.visible, st.lite)
         };
+        if visible && !shell::displays_report_refresh_rate() {
+            // e.g. a remote session just took over the desktop: get out before the next frame is drawn.
+            self.hide_to_tray();
+            self.display_usable();
+            return;
+        }
         // While PulseRAM sits in the tray, only the tray icon needs updating: filling process lists for an
         // invisible window every 1.5 s just burns CPU and battery.
         if !visible {
