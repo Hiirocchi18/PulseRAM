@@ -53,7 +53,7 @@ The download didn't arrive intact — the installer checks itself and refuses to
 
 **PulseRAM** is a native Windows desktop application written in **Rust**. The engine talks directly to **Win32 / NT** (`ntdll.dll`, `psapi.dll`, `kernel32.dll`, `advapi32.dll`, `pdh.dll`); the interface is built with [Slint](https://slint.dev) and drawn by its software renderer.
 
-A tool that manages your RAM shouldn't need much of it. PulseRAM is one statically linked EXE — no .NET, no web runtime, no GPU surface, no drivers — and it releases its dashboard window completely while it sits in the tray. It collects no telemetry. Its only network request is an optional once-a-day check for a new version on GitHub (see *Privacy*).
+A tool that manages your RAM shouldn't need much of it. PulseRAM is one statically linked EXE — no .NET, no web runtime, no GPU surface, no drivers — and it stops drawing and refreshing its window while it sits in the tray. It collects no telemetry. Its only network request is an optional once-a-day check for a new version on GitHub (see *Privacy*).
 
 > **2.0 is a rewrite.** Versions up to 1.4.1 were C# / WinUI 3 and bundled .NET and the Windows App SDK. 2.0 keeps the same features, settings file and layout. See the [changelog](CHANGELOG.md).
 
@@ -135,7 +135,7 @@ Shielded apps, critical system processes and (by default) the foreground app are
   * The defaults avoid `Ctrl+Shift+M` (Teams mute) and `Ctrl+Shift+P` (VS Code command palette). If a hotkey is already taken, PulseRAM tells you instead of failing silently.
 * **Live tray icon**: shows the current RAM % (green → amber → red with memory pressure), drawn crisply for any display scaling. Live tooltip and a quick-action menu; launching PulseRAM again brings the existing window forward.
 * **Minimize to tray** (on by default): the window's minimize button hides PulseRAM to the tray, where it keeps running; click the tray icon to bring it back. Untick *Profiles → Device → Minimize to tray* to minimize to the taskbar instead.
-* **Light in the tray**: while hidden, PulseRAM releases its window, stops preparing anything for display and runs itself in Windows **Efficiency Mode** (EcoQoS, below-normal priority).
+* **Light in the tray**: while hidden, PulseRAM stops preparing anything for display and runs itself in Windows **Efficiency Mode** (EcoQoS, below-normal priority).
 
 ### 6. Compact widget
 * The **compact** button (next to *Auto* in the top bar) turns PulseRAM into a small always-on-top widget, about 300 × 100: a RAM ring with the %, used / total, free memory and Auto-Pilot status, and one **Clean** button for the selected mode.

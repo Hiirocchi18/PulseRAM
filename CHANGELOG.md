@@ -6,7 +6,7 @@ PulseRAM is rewritten in **Rust**, with a new interface built with [Slint](https
 
 ### Changed
 - **One small EXE instead of a bundled runtime.** 1.x shipped .NET 10 and the Windows App SDK (a few hundred files, ~22 MB installer). 2.0 is a single statically linked `PulseRAM.exe` with no runtime to install or load.
-- **Lower memory and CPU use by PulseRAM itself.** No .NET runtime, no garbage collector and no GPU surface. While hidden in the tray the dashboard window is released entirely, and the compact widget only updates the few numbers it shows.
+- **Lower memory and CPU use by PulseRAM itself.** No .NET runtime, no garbage collector and no GPU surface. While hidden in the tray nothing is prepared or drawn, and the compact widget only updates the few numbers it shows.
 - **Cheaper process scans.** The process list now comes from a single system call per scan instead of opening every process.
 - **New interface, same layout.** Dashboard, Processes, Profiles, the compact widget, light/dark theme and tooltips are rebuilt in Slint. Drop-down lists became segmented buttons, dialogs open inside the window, and the tray and widget menus are native Windows menus.
 - The ambient gauge animations (rotating ring, breathing halo, shockwave) are gone: they kept the window repainting for no information. The gauge still animates between readings.
