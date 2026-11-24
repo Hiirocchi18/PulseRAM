@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.0.0 — unreleased
+
+PulseRAM is rewritten in **Rust**, with a new interface built with [Slint](https://slint.dev) and drawn by its software renderer. Features, settings and file formats are the same as 1.4.1; the app itself is much smaller and lighter.
+
+### Changed
+- **One small EXE instead of a bundled runtime.** 1.x shipped .NET 10 and the Windows App SDK (a few hundred files, ~22 MB installer). 2.0 is a single statically linked `PulseRAM.exe` with no runtime to install or load.
+- **Lower memory and CPU use by PulseRAM itself.** No .NET runtime, no garbage collector and no GPU surface. While hidden in the tray nothing is prepared or drawn, and the compact widget only updates the few numbers it shows.
+- **Cheaper process scans.** The process list now comes from a single system call per scan instead of opening every process.
+- **New interface, same layout.** Dashboard, Processes, Profiles, the compact widget, light/dark theme and tooltips are rebuilt in Slint. Drop-down lists became segmented buttons, dialogs open inside the window, and the tray and widget menus are native Windows menus.
+- The ambient gauge animations (rotating ring, breathing halo, shockwave) are gone: they kept the window repainting for no information. The gauge still animates between readings.
+- A left-click on the tray icon opens PulseRAM (double-click still works).
+- Upgrading from 1.x keeps your settings (same `pulseram_config.json`), frozen-app journal and startup entry. The installer removes the old .NET files from the install folder.
+
+### Kept from 1.4.1
+- All four clean modes, Auto-Pilot with adaptive back-off, CPU guard, smart standby purge, leak guard and the leaks list, hard memory caps, Eco, Freeze/Thaw with crash-safe journal, workload profiles, hotkeys, live tray %, memory-limit warning, update notice, portable mode, and the command-line switches.
+- Every security measure for running as administrator: session and integrity checks for caps/freeze/Eco, link-safe writes in the data folder, RedirectionGuard, the protected-install check for the elevated startup task, and opening pages/folders through Explorer.
+
+### For contributors
+- Build with `cargo build --release` (Rust stable + Visual Studio C++ build tools); .NET and the Windows App SDK are no longer needed.
+- Layout: `src/engine.rs` (engine), `src/sys/windows/` (all Win32/NT calls), `src/policy.rs`, `src/leaks.rs`, `src/config.rs` (pure logic with unit tests), `src/app.rs` + `ui/*.slint` (interface), `src/shell.rs` (tray, hotkeys, menus).
+- `cargo test` runs on any OS: non-Windows builds use a small fake platform (`src/sys/stub.rs`), which also lets the interface be previewed on Linux.
+
 ## v1.4.1 — 2026-10-18
 
 Security release. Upgrading is recommended for everyone who used "Start with Windows" while running PulseRAM as administrator.

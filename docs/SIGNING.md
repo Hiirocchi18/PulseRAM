@@ -1,7 +1,7 @@
 # Code signing (removes the SmartScreen warning)
 
 The build is ready for signing: once the settings below exist, every **published release** is signed
-automatically. `PulseRAM.exe`/`PulseRAM.dll` are signed before they are packaged, then the installer. Ordinary
+automatically. `PulseRAM.exe` is signed before it is packaged, then the installer. Ordinary
 pushes and pull requests are never signed, so you only have to approve releases.
 
 PulseRAM uses [SignPath Foundation](https://signpath.org/), which signs open-source projects for free with a

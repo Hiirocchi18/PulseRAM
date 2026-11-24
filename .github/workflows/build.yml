@@ -21,14 +21,17 @@ jobs:
   tests:
     name: Unit tests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
-        with:
-          dotnet-version: "10.0.x"
       - name: Run tests
-        run: dotnet test tests/PulseRAM.Tests/PulseRAM.Tests.csproj --logger "console;verbosity=normal"
+        run: |
+          # The Linux build of the UI toolkit links against fontconfig (PulseRAM itself only ships for Windows).
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfontconfig1-dev
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo test --locked
 
   build:
     name: Build ${{ matrix.arch }}
@@ -38,11 +41,11 @@ jobs:
       matrix:
         include:
           - arch: x64
-            platform: x64
+            target: x86_64-pc-windows-msvc
             runner: windows-latest
             suffix: ""
           - arch: arm64
-            platform: ARM64
+            target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             suffix: "-arm64"
     runs-on: ${{ matrix.runner }}
@@ -54,56 +57,47 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
-        with:
-          dotnet-version: "10.0.x"
-
       - name: Read version
         id: ver
         shell: pwsh
         run: |
-          [xml]$proj = Get-Content PulseRAM.csproj
-          $v = ($proj.Project.PropertyGroup | Where-Object { $_.Version } | Select-Object -First 1).Version
+          $v = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           "version=$v" >> $env:GITHUB_OUTPUT
           Write-Host "PulseRAM version $v ($env:PROCESSOR_ARCHITECTURE runner)"
 
-      - name: Publish self-contained (with WinUI resources)
+      - name: Build release EXE
         shell: pwsh
         run: |
-          # The PRI (WinUI resource) tasks ship with Visual Studio, not the dotnet CLI.
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -prerelease -products * -requires Microsoft.Component.MSBuild -property installationPath
-          Write-Host "Visual Studio: $vs"
-          $msbuild = @("MSBuild\Current\Bin\arm64\MSBuild.exe", "MSBuild\Current\Bin\amd64\MSBuild.exe", "MSBuild\Current\Bin\MSBuild.exe") |
-            ForEach-Object { Join-Path $vs $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
-          Write-Host "MSBuild: $msbuild"
-          $out = Join-Path $PWD "$env:PUBLISH\"
-          & $msbuild PulseRAM.csproj -restore -t:Publish -v:minimal -nologo "-flp:logfile=msbuild.log;verbosity=normal" `
-            -p:Configuration=Release "-p:Platform=${{ matrix.platform }}" "-p:RuntimeIdentifier=win-${{ matrix.arch }}" -p:SelfContained=true `
-            "-p:PublishDir=$out" `
-            -p:EnableCoreMrtTooling=true -p:AppxGeneratePriEnabled=true -p:IncludeProjectPriFile=true
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }}
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Copy-Item PulseRAM.ico $env:PUBLISH -Force
-          Get-ChildItem $env:PUBLISH -Filter *.pdb -Recurse | Remove-Item -Force
+          New-Item -ItemType Directory -Force $env:PUBLISH | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\PulseRAM.exe" $env:PUBLISH
+          Copy-Item pulseram_defaults.json, PulseRAM.ico $env:PUBLISH
+
+      - name: Unit tests on Windows
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cargo test --locked --target ${{ matrix.target }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify files and report size
         shell: pwsh
         run: |
           $dir = $env:PUBLISH
           $missing = @()
-          foreach ($f in @("PulseRAM.exe", "PulseRAM.dll", "resources.pri", "Microsoft.UI.Xaml.Controls.pri", "pulseram_defaults.json")) {
+          foreach ($f in @("PulseRAM.exe", "pulseram_defaults.json", "PulseRAM.ico")) {
             if (-not (Test-Path (Join-Path $dir $f))) { $missing += $f }
           }
-          if ($missing.Count -gt 0) { Write-Error "Missing from publish output: $($missing -join ', ')"; exit 1 }
-          $files = Get-ChildItem $dir -Recurse -File
-          "Publish output: {0} files, {1:N1} MB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB)
-          "== Largest files =="
-          $files | Sort-Object Length -Descending | Select-Object -First 15 | ForEach-Object { "{0,8:N2} MB  {1}" -f ($_.Length / 1MB), $_.FullName.Substring((Resolve-Path $dir).Path.Length + 1) }
-          "== Sub-folders =="
-          Get-ChildItem $dir -Directory | ForEach-Object {
-            $s = (Get-ChildItem $_.FullName -Recurse -File | Measure-Object Length -Sum).Sum
-            "{0,8:N2} MB  {1}\" -f ($s / 1MB), $_.Name
-          }
+          if ($missing.Count -gt 0) { Write-Error "Missing from the build output: $($missing -join ', ')"; exit 1 }
+          Get-ChildItem $dir -File | ForEach-Object { "{0,8:N2} MB  {1}" -f ($_.Length / 1MB), $_.Name }
+          $ver = (Get-Item (Join-Path $dir "PulseRAM.exe")).VersionInfo.FileVersion
+          Write-Host "File version: $ver"
+          # The installer's upgrade step relies on the EXE carrying its version.
+          if (-not $ver -or -not $ver.StartsWith("${{ steps.ver.outputs.version }}")) { Write-Error "PulseRAM.exe has no version resource matching ${{ steps.ver.outputs.version }}"; exit 1 }
 
       - name: Smoke test (full view, compact view, screenshots)
         shell: pwsh
@@ -127,7 +121,7 @@ jobs:
             $p.Refresh()
             if ($p.HasExited) {
               Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-3) } -ErrorAction SilentlyContinue |
-                Where-Object { $_.ProviderName -in @('Application Error', '.NET Runtime', 'Windows Error Reporting') } |
+                Where-Object { $_.ProviderName -in @('Application Error', 'Windows Error Reporting') } |
                 Select-Object -First 5 | Format-List TimeCreated, ProviderName, Message
               $l = Get-ChildItem (Join-Path $data "logs") -Filter "pulseram-*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
               if ($l) { "== PulseRAM log =="; Get-Content $l.FullName -Tail 60 }
@@ -156,6 +150,13 @@ jobs:
           Start-Sleep -Seconds 15
           Assert-Running $p "second start"
           Save-Screen "screenshots\full.png"
+          $p.Refresh()
+          if ($p.MainWindowHandle -eq [IntPtr]::Zero) {
+            Get-Content $logFile.FullName -Tail 20
+            Write-Error "PulseRAM is running but its dashboard window did not open"; exit 1
+          }
+          $p.Refresh()
+          "PulseRAM memory with the dashboard open: {0:N1} MB working set, {1:N1} MB private" -f ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB)
           $personalize = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
           $oldLight = (Get-ItemProperty $personalize -Name AppsUseLightTheme -ErrorAction SilentlyContinue).AppsUseLightTheme
           if ($null -eq $oldLight) { $oldLight = 1 }
@@ -188,6 +189,18 @@ jobs:
             Assert-Running $p "minimize to tray"
             if ([Win32.Msg]::IsWindowVisible($hwnd)) { Write-Error "Minimize did not hide PulseRAM to the tray"; exit 1 }
             Write-Host "Minimize to tray: window hidden, app still running"
+            Start-Sleep -Seconds 4
+            $p.Refresh()
+            "PulseRAM memory hidden in the tray: {0:N1} MB working set, {1:N1} MB private" -f ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB)
+            # Launching PulseRAM again must bring the hidden window back instead of starting a second copy.
+            $again = Start-Process -FilePath $exe -PassThru
+            $again.WaitForExit(15000) | Out-Null
+            if (-not $again.HasExited) { Stop-Process -Id $again.Id -Force; Write-Error "A second PulseRAM kept running instead of handing over to the first"; exit 1 }
+            Start-Sleep -Seconds 4
+            Assert-Running $p "second launch"
+            $p.Refresh()
+            if ($p.MainWindowHandle -eq [IntPtr]::Zero -or -not [Win32.Msg]::IsWindowVisible($p.MainWindowHandle)) { Write-Error "A second launch did not bring PulseRAM back from the tray"; exit 1 }
+            Write-Host "Second launch: window restored from the tray"
           } else {
             Write-Host "The tray icon couldn't be added on this runner (no ready taskbar); minimize-to-tray test skipped"
           }
@@ -223,9 +236,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: unsigned-app-${{ matrix.arch }}
-          path: |
-            ${{ env.PUBLISH }}/PulseRAM.exe
-            ${{ env.PUBLISH }}/PulseRAM.dll
+          path: ${{ env.PUBLISH }}/PulseRAM.exe
 
       - name: Sign app files (SignPath)
         if: env.SIGNING == 'true'
@@ -254,7 +265,7 @@ jobs:
           choco install innosetup --version 6.7.1 -y --no-progress
           $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) { Write-Error "ISCC.exe not found"; exit 1 }
-          & $iscc "/DMyArch=${{ matrix.arch }}" "/DPublishDir=$env:PUBLISH" PulseRAM.iss
+          & $iscc "/DMyArch=${{ matrix.arch }}" "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/DPublishDir=$env:PUBLISH" PulseRAM.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $exe = "dist\PulseRAM-Setup-v${{ steps.ver.outputs.version }}${{ matrix.suffix }}.exe"
           if (-not (Test-Path $exe)) { Write-Error "Installer not produced"; exit 1 }
